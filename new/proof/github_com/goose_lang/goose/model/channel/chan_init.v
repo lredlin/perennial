@@ -1,4 +1,4 @@
-From New.generatedproof.github_com.goose_lang.goose Require Import model.channel_v2.
+From New.generatedproof.github_com.goose_lang.goose Require Import model.channel.
 From New.proof Require Import proof_prelude.
 From New.proof.github_com.goose_lang Require Import primitive.
 From New.proof.github_com.goose_lang.std Require Import std_core.

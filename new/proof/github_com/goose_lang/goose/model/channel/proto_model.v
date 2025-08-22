@@ -35,7 +35,7 @@ The defined functions on the type [proto] are:
   all terminations [END] in [p1] with [p2]. *)
 From iris.base_logic Require Import base_logic.
 From iris.proofmode Require Import proofmode.
-From New.proof.github_com.goose_lang.goose.model.channelv2 Require Import cofe_solver_2.
+From New.proof.github_com.goose_lang.goose.model.channel Require Import cofe_solver_2.
 
 Set Default Proof Using "Type".
 

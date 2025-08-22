@@ -50,7 +50,7 @@ From iris.proofmode Require Import proofmode.
 From iris.base_logic Require Export lib.iprop.
 From iris.base_logic Require Import lib.own.
 From iris.program_logic Require Import language.
-From New.proof.github_com.goose_lang.goose.model.channelv2 Require Import proto_model.
+From New.proof.github_com.goose_lang.goose.model.channel Require Import proto_model.
 Set Default Proof Using "Type".
 Export action.
 
