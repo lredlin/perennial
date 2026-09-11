@@ -271,15 +271,22 @@ Local Ltac mx_step st h :=
   iMod (own_chan_halves_update st with "Hoc Himpl") as "[H1 H2]";
   [ simpl in h |- *; lia | ].
 
+(** One later credit, not four.  Each [send_au] arm is separately handed a
+    credit by the channel, which pays for opening this file's invariant; the one
+    below pays for the [▷] that Mixtris's own [iProto_step] (fast path) and
+    [saved_prop_agree] (slow path, phase two) produce.  Those two are in
+    different [∧] conjuncts, which share resources, so a single credit serves
+    both.  It cannot go to zero: no program step is available inside a view
+    shift, and the protocol contents are not [Timeless]. *)
 Lemma mixtris_send_au γ ch γch i j (v : V) m (p : iProto Σ V) Φ :
-  £1 ∗ £1 ∗ £1 ∗ £1 -∗
+  £1 -∗
   is_edge_chan γ ch γch i j -∗
   i ↣[γ] (<(Send, j)> m) -∗
   iMsg_car m v (Next p) -∗
   ▷ (i ↣[γ] p -∗ Φ) -∗
   send_au γch V v Φ.
 Proof.
-  iIntros "(H£1 & H£2 & H£3 & H£4) #Hedge Hown Hm HΦ".
+  iIntros "H£ #Hedge Hown Hm HΦ".
   iDestruct "Hedge" as (γs γr) "[#Hch #Hslot]".
   iDestruct "Hown" as "[#Hctx Hp]".
   rewrite /send_au. repeat iSplit.
@@ -287,7 +294,7 @@ Proof.
     iIntros "[Hlc Himpl]". mx_openc. mx_step (chanstate.SndDone v) Hcv1.
     iDestruct "Hrest" as "[Hsfree (%m2 & Hr1 & Hpj)]".
     iMod (iProto_step with "Hctxi Hp Hpj Hm") as "Hstep".
-    iMod (lc_fupd_elim_later with "H£2 Hstep") as (p2) "(Hm2 & Hctxi & Hpi & Hpj)".
+    iMod (lc_fupd_elim_later with "H£ Hstep") as (p2) "(Hm2 & Hctxi & Hpi & Hpj)".
     iMod ("Hclosec" with "[$Hctxi]") as "_".
     iMod ("Hcloses" with "[H1 Hsfree Hr1 Hm2 Hpj]") as "_".
     { iNext. iExists (chanstate.SndDone v). iFrame "H1 Hsfree".
@@ -318,7 +325,7 @@ Proof.
     iMod ("Hcloses" with "[H1 Hsa Hsb Hrfree]") as "_".
     { iNext. iExists chanstate.Idle. iFrame "H1 Hrfree". iExists True%I. iFrame. }
     iCombine "Heq Hres" as "H".
-    iMod (lc_fupd_elim_later with "H£3 H") as "[Heq' Hres]".
+    iMod (lc_fupd_elim_later with "H£ H") as "[Heq' Hres]".
     iRewrite -"Heq'" in "Hres".
     iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
   - (* send_enq_au : these channels are unbuffered *)
@@ -337,7 +344,7 @@ Proof using W.
   iIntros (Φ) "(#Hedge & Hown & Hm) HΦ".
   iDestruct "Hedge" as (γs γr) "#[Hch Hslot]".
   iApply (chan.wp_send with "Hch").
-  iIntros "H£".
+  iIntros "(H£ & _)".
   iApply (mixtris_send_au with "H£ [$Hch $Hslot] Hown Hm").
   iIntros "!> Hp". by iApply "HΦ".
 Qed.
@@ -364,13 +371,13 @@ Qed.
 (** The atomic-update form of the receive rule, for [RecvCase] clauses of
     [chan.wp_select_blocking]. *)
 Lemma mixtris_recv_au γ ch γch i j m Φ :
-  £1 ∗ £1 ∗ £1 ∗ £1 -∗
+  £1 -∗
   is_edge_chan γ ch γch i j -∗
   j ↣[γ] (<(Recv, i)> m) -∗
   ▷ (∀ v p, iMsg_car m v (Next p) -∗ j ↣[γ] p -∗ Φ v true) -∗
   recv_au γch V Φ.
 Proof.
-  iIntros "(H£1 & H£2 & H£3 & H£4) #Hedge Hown HΦ".
+  iIntros "H£ #Hedge Hown HΦ".
   iDestruct "Hedge" as (γs γr) "[#Hch #Hslot]".
   iDestruct "Hown" as "[#Hctx Hp]".
   rewrite /recv_au. repeat iSplit.
@@ -378,7 +385,7 @@ Proof.
     iIntros (w) "[Hlc Himpl]". mx_openc. mx_step (@chanstate.RcvDone V) Hcv1.
     iDestruct "Hrest" as "[(%m1 & %p1 & Hs1 & Hpi & Hm1) Hrfree]".
     iMod (iProto_step with "Hctxi Hpi Hp Hm1") as "Hstep".
-    iMod (lc_fupd_elim_later with "H£2 Hstep") as (p2) "(Hm2 & Hctxi & Hpi & Hpj)".
+    iMod (lc_fupd_elim_later with "H£ Hstep") as (p2) "(Hm2 & Hctxi & Hpi & Hpj)".
     iMod ("Hclosec" with "[$Hctxi]") as "_".
     iMod ("Hcloses" with "[H1 Hs1 Hpi Hrfree]") as "_".
     { iNext. iExists chanstate.RcvDone. iFrame "H1 Hrfree". iExists p1. iFrame. }
@@ -407,7 +414,7 @@ Proof.
     iMod ("Hcloses" with "[H1 Hsfree Hra Hrb]") as "_".
     { iNext. iExists chanstate.Idle. iFrame "H1 Hsfree". iExists (λ _, True%I). iFrame. }
     iCombine "Heq Hres" as "H".
-    iMod (lc_fupd_elim_later with "H£3 H") as "[Heq' Hres]".
+    iMod (lc_fupd_elim_later with "H£ H") as "[Heq' Hres]".
     iRewrite -"Heq'" in "Hres".
     iDestruct "Hres" as (p2) "[Hm2 Hpj]".
     iModIntro. iFrame "H2". iApply ("HΦ" with "Hm2"). by iFrame "#∗".
@@ -429,7 +436,7 @@ Proof using W.
   iIntros "#Hedge Hown HΦ".
   iDestruct "Hedge" as (γs γr) "#[Hch Hslot]".
   iApply (chan.wp_receive with "Hch").
-  iIntros "H£".
+  iIntros "(H£ & _)".
   by iApply (mixtris_recv_au with "H£ [$Hch $Hslot] Hown HΦ").
 Qed.
 

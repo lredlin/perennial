@@ -133,7 +133,7 @@ Section lang.
       (tp : TT -t> iProto Σ V) (v : V) Φ :
     ProtoChoice q (Send, j) m →
     MsgTele m tv tP tp →
-    £1 ∗ £1 ∗ £1 ∗ £1 -∗
+    £1 -∗
     is_edge_chan γ ch γch i j -∗
     i ↣[γ] q -∗
     (∃.. x : TT, ⌜ v = tele_app tv x ⌝ ∗ tele_app tP x ∗
@@ -159,7 +159,7 @@ Section lang.
       (tp : TT -t> iProto Σ V) Φ :
     ProtoChoice q (Recv, i) m →
     MsgTele m tv tP tp →
-    £1 ∗ £1 ∗ £1 ∗ £1 -∗
+    £1 -∗
     is_edge_chan γ ch γch i j -∗
     j ↣[γ] q -∗
     ▷ (∀.. x : TT, tele_app tP x -∗ j ↣[γ] tele_app tp x -∗
@@ -196,7 +196,7 @@ Section lang.
   Proof using W.
     iIntros (Hc Hm Φ) "(#He & Hown & HP) HΦ".
     iDestruct (is_edge_chan_is_chan with "He") as "#Hch".
-    iApply (chan.wp_send with "Hch"). iIntros "H£".
+    iApply (chan.wp_send with "Hch"). iIntros "(H£ & _)".
     iApply (mixtris_select_send with "H£ He Hown [HP HΦ]").
     iExists x. iFrame "HP". by iSplit.
   Qed.
@@ -213,7 +213,7 @@ Section lang.
   Proof using W.
     iIntros (Hc Hm Φ) "[#He Hown] HΦ".
     iDestruct (is_edge_chan_is_chan with "He") as "#Hch".
-    iApply (chan.wp_receive with "Hch"). iIntros "H£".
+    iApply (chan.wp_receive with "Hch"). iIntros "(H£ & _)".
     iApply (mixtris_select_recv with "H£ He Hown").
     iIntros "!>" (x) "HP Hown".
     iApply "HΦ". iFrame.
