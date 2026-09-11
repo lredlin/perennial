@@ -81,7 +81,7 @@ Proof.
   iSplit.
   { (* Branch 1: primary responded before hedge threshold. *)
     repeat iExists _; iSplitL ""; first done. iFrame "#".
-    iApply (bag_recv_au with "[$] [$Hch]").
+    iApply (bag_recv_au with "[$Hch]").
     iNext. iIntros (v) "%Hres". wp_auto.
     destruct Hres as [-> | ->].
     - iApply "HΦ". iLeft. iPureIntro;left;done.
@@ -92,7 +92,7 @@ Proof.
     iExists time.Time.t, hedge_ch, γhedge.
     repeat iExists _. iSplitL ""; first done. iFrame "#".
     iSplitL "". { iApply is_bag_is_chan. done. }
-    iApply (bag_recv_au with "[$] [$Hhedge]").
+    iApply (bag_recv_au with "[$Hhedge]").
     iNext. iIntros (v) "_". wp_auto_lc 2.
 
     (* Fork secondary now that the hedge threshold has fired. *)
@@ -109,7 +109,7 @@ Proof.
     iSplit.
     { (* Branch 2a: primary or secondary result arrives. *)
       repeat iExists _; iSplitL ""; first done. iFrame "#".
-      iApply (bag_recv_au with "[$] [$Hch]").
+      iApply (bag_recv_au with "[$Hch]").
       iNext. iIntros (v0) "%Hres'". wp_auto_lc 4.
       destruct Hres' as [-> | ->].
       - iApply "HΦ". iLeft. iPureIntro;left;done.
@@ -210,7 +210,7 @@ Proof.
   iSplit.
     {
       repeat iExists _; iSplitR; first done. iFrame "#".
-      iApply (bag_recv_au with "[$] [$Hfut]").
+      iApply (bag_recv_au with "[$Hfut]").
       iNext. iIntros (v). iIntros "%Hw".
       wp_auto. subst v. iApply "HΦ". iPureIntro. right. done.
     }

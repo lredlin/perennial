@@ -28,9 +28,9 @@ Definition is_handshake γ (ch : loc)  (P: V -> iProp Σ) Q : iProp Σ :=
     (match s with
      | chanstate.Idle =>
         True
-     | chanstate.SndPending v | chanstate.SndCommit v =>
+     | chanstate.SndWait v | chanstate.SndDone v =>
          P v
-     | chanstate.RcvPending | chanstate.RcvCommit =>
+     | chanstate.RcvWait | chanstate.RcvDone =>
          Q
      (* Can't use buffered channel and we don't close here. *)
      | _ => False
@@ -50,37 +50,57 @@ Proof.
   iFrame "∗%#".
 Qed.
 
+(* Open the handshake invariant and hand the arm the invariant's half. *)
+Local Ltac hs_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iCombine "Hi Hcont" as "Hic";
+  iMod (lc_fupd_elim_later with "Hlc Hic") as "[Hi Hcont]";
+  iDestruct "Hi" as (s) "[Hoc HI]".
+(* Phase two of a two-phase arm: [Hcont] was already stripped in phase one. *)
+Local Ltac hs_open2 :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iDestruct "Hi" as (s) "[Hoc HI]".
+Local Ltac hs_agree := iDestruct (own_chan_agree with "Hoc Himpl") as %->; simpl.
+(* The arm's pre-state contradicts the invariant. *)
+Local Ltac hs_absurd := hs_agree; iDestruct "HI" as "[]".
+Local Ltac hs_step st :=
+  hs_agree;
+  iDestruct (own_chan_cap_valid with "Himpl") as %?;
+  iMod (own_chan_halves_update st with "Hoc Himpl") as "[H1 H2]";
+  [ simpl in *; lia | ].
+
+(* No later credits needed: each conjunct is discharged by agreement between
+   the invariant's half of [own_chan] and the half the arm is handed. *)
 Lemma handshake_receive_au γ ch P Q Φ :
-  £1 ∗ £1 -∗
   is_handshake γ ch P Q -∗
   Q -∗
   ▷(∀ v, P v -∗ Φ v true) -∗
   recv_au γ V Φ.
 Proof.
-  iIntros "(Hlc1 & Hlc2) #His HQ Hau".
-  iPoseProof "His" as "[Hchan Hinv]".
-  iInv "Hinv" as "Hi" "Hclose".
-  iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-  iNamed "Hi".
-  iApply fupd_mask_intro; [ solve_ndisj | iIntros "Hmask"].
-  iNext. iNamed "Hi". iFrame.
-   destruct s. all:try done.
-   -   iIntros "H".
-    iMod "Hmask" as "_". iMod ("Hclose" with "[-Hau Hlc1]").
-    +  iModIntro. iExists chanstate.RcvPending.  iFrame.
-    + iModIntro.  iInv "Hinv" as "Hi" "Hclose".
-      iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-   iNamed "Hi".  iApply fupd_mask_intro; [ solve_ndisj | iIntros "Hmask"].
-   iModIntro. iExists s. iFrame. destruct s. all: try done.
-   { iMod "Hmask" as "_". iIntros "Hid". iMod ("Hclose" with "[-Hau Hi]").
-     { iModIntro.  iFrame. }
-     iModIntro.  { iApply "Hau". done. }
-   }
-   -  iIntros "H".
-    iMod "Hmask" as "_". iMod ("Hclose" with "[-Hau Hlc1 Hi]").
-    + iModIntro. iFrame.
-    + iModIntro.
-      iApply "Hau". done.
+  clear IntoValTyped0.
+  iIntros "#His HQ Hcont". iDestruct "His" as "[_ #Hinv]".
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au : SndWait v -> RcvDone *)
+    iIntros (w) "[Hlc Himpl]". hs_open. hs_step (@chanstate.RcvDone V).
+    iMod ("Hclose" with "[H1 HQ]") as "_".
+    { iNext. iExists chanstate.RcvDone. iFrame. }
+    iModIntro. iFrame. by iApply ("Hcont" with "HI").
+  - (* recv_slow_path_au : Idle -> RcvWait, then SndDone w -> Idle *)
+    iIntros "[Hlc Himpl]". hs_open. hs_step (@chanstate.RcvWait V).
+    iMod ("Hclose" with "[H1 HQ]") as "_".
+    { iNext. iExists chanstate.RcvWait. iFrame. }
+    iModIntro. iFrame. try iClear "HI".
+    iIntros (w) "[Hlc Himpl]". hs_open2. hs_step (@chanstate.Idle V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.Idle. by iFrame. }
+    iModIntro. iFrame. by iApply ("Hcont" with "HI").
+  - (* recv_deq_au : this idiom bans buffered channels *)
+    iIntros (w rest) "[Hlc Himpl]". hs_open. hs_absurd.
+  - (* recv_drain_au *)
+    iIntros (w rest) "[Hlc Himpl]". hs_open. hs_absurd.
+  - (* recv_closed_au : this idiom never closes *)
+    iIntros "[Hlc Himpl]". hs_open. hs_absurd.
 Qed.
 
 Lemma wp_handshake_receive γ ch P Q :
@@ -95,41 +115,38 @@ Lemma wp_handshake_receive γ ch P Q :
 Proof using W.
   iIntros (?) "((#Hchan & #Hinv) & HQ) HΦ".
   wp_apply ((chan.wp_receive ch γ Φ  ) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2 & Hlc3 & _)".
-  iApply (handshake_receive_au with "[$] [$] [$HQ]").
+  iIntros "_".
+  iApply (handshake_receive_au with "[$Hchan $Hinv] [$HQ]").
   done.
 Qed.
 
 Lemma handshake_send_au γ ch v P Q Φ :
-  £1 ∗ £1 ∗ £1 -∗
   is_handshake γ ch P Q -∗
   P v -∗
   ▷(Q -∗ Φ) -∗
-  send_au γ v Φ.
+  send_au γ V v Φ.
 Proof.
-  iIntros "(Hlc1 & Hlc2 & Hlc3) #Hchan HP Hau".
-  iDestruct "Hchan" as "[Hchan Hinv]".
-  iInv "Hinv" as "Hi" "Hclose".
-   iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-   iNamed "Hi".
-   iApply fupd_mask_intro; [ solve_ndisj | iIntros "Hmask"].
-  iNext. iNamed "Hi". iFrame.
-   destruct s. all:try done.
-   - iIntros "H".
-    iMod "Hmask" as "_". iMod ("Hclose" with "[-Hau Hlc1]").
-    + iModIntro. iExists (chanstate.SndPending v).  iFrame.
-    + iModIntro.  iInv "Hinv" as "Hi" "Hclose".
-      iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-   iNamed "Hi".  iApply fupd_mask_intro; [ solve_ndisj | iIntros "Hmask"].
-   iModIntro. iExists s. iFrame. destruct s. all: try done.
-   { iMod "Hmask" as "_". iIntros "Hid". iMod ("Hclose" with "[-Hau Hi]").
-     { iModIntro.  iFrame. }
-     iModIntro.  iApply "Hau". done.
-   }
-   - iIntros "Hsd".
-    iMod "Hmask" as "_". iMod ("Hclose" with "[-Hau Hlc1 Hi]").
-    + iModIntro.  iFrame.
-    + iModIntro.  iApply "Hau". done.
+  clear IntoValTyped0.
+  iIntros "#His HP Hcont". iDestruct "His" as "[_ #Hinv]".
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au : RcvWait -> SndDone v *)
+    iIntros "[Hlc Himpl]". hs_open. hs_step (chanstate.SndDone v).
+    iMod ("Hclose" with "[H1 HP]") as "_".
+    { iNext. iExists (chanstate.SndDone v). iFrame. }
+    iModIntro. iFrame. by iApply ("Hcont" with "HI").
+  - (* send_slow_path_au : Idle -> SndWait v, then RcvDone -> Idle *)
+    iIntros "[Hlc Himpl]". hs_open. hs_step (chanstate.SndWait v).
+    iMod ("Hclose" with "[H1 HP]") as "_".
+    { iNext. iExists (chanstate.SndWait v). iFrame. }
+    iModIntro. iFrame. try iClear "HI".
+    iIntros "[Hlc Himpl]". hs_open2. hs_step (@chanstate.Idle V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.Idle. by iFrame. }
+    iModIntro. iFrame. by iApply ("Hcont" with "HI").
+  - (* send_enq_au : this idiom bans buffered channels *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". hs_open. hs_absurd.
+  - (* send_closed_au : this idiom never closes *)
+    iIntros (drain) "[Hlc Himpl]". hs_open. hs_absurd.
 Qed.
 
 Lemma wp_handshake_send γ ch v P Q :
@@ -144,8 +161,8 @@ Lemma wp_handshake_send γ ch v P Q :
 Proof using W.
   iIntros (?) "((#Hchan & #Hinv) & HP) HΦ".
   wp_apply ((chan.wp_send ch v γ Φ  ) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2 & Hlc3 & _)".
-  iApply (handshake_send_au with "[$] [$] [$]").
+  iIntros "_".
+  iApply (handshake_send_au with "[$Hchan $Hinv] [$HP]").
   done.
 Qed.
 

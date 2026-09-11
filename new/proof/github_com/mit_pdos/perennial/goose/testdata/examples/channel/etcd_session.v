@@ -80,7 +80,7 @@ Lemma wp_monitorSession ch γch :
       "Hsessionc" ∷ own_broadcast_chan ch γch True broadcast.Pending ∗
       "#Hsessionc_is" ∷ is_chan ch γch unit
 (* TODO now: reduce the frequency with which [is_chan] has to be manually written. Do this by:
-   1) putting is_chan inside the `recv_au`, `send_au`, etc. so it isn't a
+   1) putting is_chan inside the [recv_au], [send_au], etc. so it isn't a
    separate precond on the send/recv/select WPs.
    2) in the case of the broadcast spec, put is_chan inside `own_broadcast_chan`
    3) commit changes with a concise commit message.
@@ -196,7 +196,7 @@ Proof.
   rewrite big_andL_cons. iSplit.
   { repeat iExists _; iSplitR; first done.
     iDestruct (is_bag_is_chan with "[$]") as "#?".
-    iFrame "#". iApply (bag_recv_au with "[$] [$]").
+    iFrame "#". iApply (bag_recv_au with "[$]").
     iIntros "!> % ?". wp_auto. wp_apply errors.wp_New as "% _".
     wp_end. }
   rewrite big_andL_nil //.

@@ -48,7 +48,7 @@ Definition spsc_consumer (γ:spsc_names) (received:list V) : iProp Σ :=
 Definition inflight (s : chanstate.t V) : list V :=
   match s with
   | chanstate.Buffered buff => buff
-  | chanstate.SndPending v | chanstate.SndCommit v => [v]
+  | chanstate.SndWait v | chanstate.SndDone v => [v]
   | chanstate.Closed drain => drain
   | _ => []
   end.
@@ -81,7 +81,7 @@ Definition is_spsc (γ:spsc_names) (ch:loc)
         | chanstate.Buffered buff =>
             [∗ list] i ↦ v ∈ buff, P ((length recv) + i) v
         (* P holds for pending/committed values *)
-        | chanstate.SndPending v | chanstate.SndCommit v =>
+        | chanstate.SndWait v | chanstate.SndDone v =>
             P (length recv) v
         (* Closed channel: park producer permission, provide R when drained *)
         | chanstate.Closed [] =>
@@ -137,10 +137,35 @@ Qed.
 
 (** ** Receive Operation *)
 
+(* Open the spsc invariant and hand the arm the invariant's half of [own_chan]. *)
+Local Ltac sp_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iNamed "Hi".
+(* One credit strips the invariant body and the client's continuation together:
+   [▷A ∗ ▷B ⊣⊢ ▷(A ∗ B)].  Phase two of a two-phase arm uses [sp_open], since
+   the continuation was already stripped in phase one. *)
+Local Ltac sp_openc :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iCombine "Hi Hcont" as "Hic";
+  iMod (lc_fupd_elim_later with "Hlc Hic") as "[Hi Hcont]";
+  iNamed "Hi".
+Local Ltac sp_agree := iDestruct (own_chan_agree with "Hch Himpl") as %->; simpl.
+Local Ltac sp_step st h :=
+  sp_agree;
+  iDestruct (own_chan_cap_valid with "Himpl") as %h;
+  iMod (own_chan_halves_update st with "Hch Himpl") as "[H1 H2]";
+  [ simpl in h |- *; lia | ].
+
+(* Reindex the tail of a [P (length recv + i)] list after one value is consumed. *)
+Local Ltac sp_reindex l r :=
+  rewrite length_app singleton_length;
+  iApply (big_sepL_proper _ _ l with "Hrest");
+  intros k y z; replace ((length r + 1)%nat + k) with (length r + S k) by lia; done.
+
 Lemma spsc_rcv_au γ ch (P : Z -> V → iProp Σ) (R : list V → iProp Σ)
                       (received : list V) Φ :
   is_spsc γ ch P R -∗
-  £1 ∗ £1 -∗
   spsc_consumer γ received -∗
   (▷ ∀ v (ok:bool),
      (if ok then P (length received) v ∗ spsc_consumer γ (received ++ [v])
@@ -148,250 +173,106 @@ Lemma spsc_rcv_au γ ch (P : Z -> V → iProp Σ) (R : list V → iProp Σ)
      Φ v ok) -∗
   recv_au γ.(chan_name) V Φ.
 Proof.
-  iIntros "#Hspsc [Hlc1 Hlc2] Hcons Hcont".
-  unfold is_spsc.
-  iDestruct "Hspsc" as "[Hchan Hinv]".
-
-  (* Open the SPSC invariant to provide the atomic update *)
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-
-  (* Establish agreement between our received and invariant's recv *)
-  iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
-
-  (* Provide recv_au *)
-  unfold recv_au.
-  iExists s. iFrame "Hch".
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame.
-
-  (* Case analysis on channel state *)
-  destruct s; try done.
-
-  { (* Case: Buffered channel *)
-    destruct buff as [|v rest].
-    { (* Empty buffer - no change to invariant *) done. }
-    { (* Non-empty buffer - can receive immediately *)
-      iIntros "Hoc".
-
-      (* Update received history *)
-      iCombine "Hcons HrecvI" as "Hrecv_full".
-      iMod (dghost_var_update (recv ++ [v]) with "Hrecv_full") as "[HrecvI_new Hcons_new]".
-
-      (* Extract P v from the big star list *)
-      iDestruct (big_sepL_cons with "Hinv_open") as "[HPv Hrest]".
-
-      (* Close invariant with updated state *)
-      iMod "Hmask".
-      iMod ("Hinv_close" with "[Hoc HsentI HrecvI_new Hrest]") as "_".
-      {
-        iNext. iExists (chanstate.Buffered rest), sent, (recv ++ [v]).
-        iFrame. rewrite  length_app.
-
-        rewrite singleton_length. iSplitR "Hrest". {
-        iPureIntro. rewrite Hrel. simpl. rewrite <- app_assoc. reflexivity.
-        }
-        {
-          iApply (big_sepL_proper _ _ rest with "Hrest").
-intros k y z.
-replace (length recv + S k) with ((length recv + 1)%nat + k) by lia.
-done.
-
-      }
-      }
-
-      (* Apply continuation with ok=true *)
-      iModIntro. iApply "Hcont". iFrame.
-      replace  (length recv + 0%nat)  with (Z.of_nat (length recv)) by lia.
-      done.
-    }
-  }
-
-  { (* Case: Idle channel - register as receiver *)
-    iIntros "Hoc".
-
-    (* Close invariant with RcvPending state *)
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI]") as "_".
-    {
-      iNext. iExists chanstate.RcvPending, sent, recv.
-      iFrame.
-      iPureIntro. rewrite Hrel. simpl. done.
-    }
-
-    (* Provide recv_nested_au for completion *)
-    iModIntro. unfold recv_nested_au.
-    iInv "Hinv" as "Hinv_open2" "Hinv_close".
-    iMod (lc_fupd_elim_later with "Hlc2 Hinv_open2") as "Hinv_open2".
-    iNamed "Hinv_open2".
-
-    (* Establish agreement between our received and invariant's recv *)
+  clear IntoValTyped0.
+  iIntros "#Hspsc Hcons Hcont".
+  unfold is_spsc. iDestruct "Hspsc" as "[Hchan Hinv]".
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au : SndWait w -> RcvDone *)
+    iIntros (w) "[Hlc Himpl]". sp_openc.
     iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
-
-    unfold recv_au.
-    iExists s. iFrame "Hch".
-    iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask1"].
-    iNext.
-
-    (* Should be SndCommit v when sender completes *)
-    destruct s; try done.
-    {
-      (* SndCommit case - complete the handshake *)
-      iCombine "Hcons HrecvI" as "Hrcv_full".
-      iMod (dghost_var_update (recv0 ++ [v]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
-      iIntros "Hoc".
-      iMod "Hmask1".
-      iMod ("Hinv_close" with "[HsentI HrecvI_new Hoc]") as "_".
-      {
-        iNext. iExists chanstate.Idle, sent0, (recv0 ++ [v]).
-        iFrame.
-        iPureIntro. rewrite Hrel0. simpl. rewrite app_nil_r. done.
-      }
-      iModIntro. iApply "Hcont". iFrame.
-    }
-    { (* Closed empty case *)
-      destruct drain as [|v rest].
-      {
-        iIntros "Hoc".
-        iMod "Hmask1".
-        iDestruct "Hinv_open2" as "(H1 & H2)".
-        iDestruct "H2" as "[H2 | H3]".
-        {
-          iMod ("Hinv_close" with "[HsentI HrecvI Hoc H1 Hcons]") as "H".
-          {
-            iNext. iFrame.
-            iSplitR "HrecvI".
-            { iPureIntro. done. }
-            iRight. unfold spsc_consumer. subst sent0. unfold inflight. rewrite app_nil_r. done.
-          }
-          iModIntro. iApply "Hcont". iFrame.
-          subst sent0. unfold inflight. rewrite app_nil_r. iFrame.
-          done.
-        }
-        {
-          iExFalso.
-          unfold spsc_consumer.
-          iCombine "Hcons HrecvI" as "Hfull".
-          iDestruct (dghost_var_valid_2 with "Hfull H3") as "[%Hvalid _]".
-          done.
-        }
-      }
-      { done. }
-    }
-  }
-
-  { (* Case: SndPending - fast path completion *)
-    iIntros "Hcont1".
-    iMod "Hmask".
+    sp_step (@chanstate.RcvDone V) Hcv1.
     iCombine "Hcons HrecvI" as "Hrcv_full".
-    iMod (dghost_var_update (recv ++ [v]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
-    iMod ("Hinv_close" with "[HsentI HrecvI_new Hcont1]") as "H".
-    {
-      iNext. iFrame. iPureIntro.
-      unfold inflight in *. rewrite app_nil_r. done.
-    }
-    iModIntro. iApply "Hcont". iFrame.
-  }
-
-  { (* Case: Closed channel *)
-    destruct drain as [|v rest].
-    { (* Empty closed channel - return R *)
-      iIntros "Hoc".
-      iMod "Hmask".
-      iDestruct "Hinv_open" as "(H1 & H2)".
-      iDestruct "H2" as "[H2 | H3]".
-      {
-        iMod ("Hinv_close" with "[HsentI HrecvI Hoc H1 Hcons]") as "H".
-        {
-          iNext. iFrame.
-          iSplitR "HrecvI".
-          { iPureIntro. done. }
-          iRight. unfold spsc_consumer. subst sent. unfold inflight. rewrite app_nil_r. done.
-        }
-        iModIntro. iApply "Hcont". iFrame.
-        subst sent. unfold inflight. rewrite app_nil_r. iFrame.
-        done.
-      }
-      {
-        iExFalso.
-        unfold spsc_consumer.
-        iCombine "Hcons HrecvI" as "Hfull".
-        iDestruct (dghost_var_valid_2 with "Hfull H3") as "[%Hvalid _]".
-        done.
-      }
-    }
-    { (* Closed channel with drain values *)
-      iIntros "Hoc".
-      iCombine "Hcons HrecvI" as "Hrcv_full".
-      iMod (dghost_var_update (recv ++ [v]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
-      iMod "Hmask".
-      iDestruct "Hinv_open" as "(H1 & H2 & H3)".
-      iDestruct "H3" as "[H4 | H5]".
-      {
-        destruct rest.
-        {
-          iMod ("Hinv_close" with "[HsentI Hoc H2 H4 Hcons_new]") as "H".
-          {
-            iNext. iFrame. iSplitR "H4". { iPureIntro.  unfold inflight in *. rewrite <- app_assoc. done.   }
-            iLeft. done.
-          }
-          iApply "Hcont". iModIntro. iFrame.
-          iDestruct "H1" as "[HPv _]". iFrame.
-      replace  (length recv + 0%nat)  with (Z.of_nat (length recv)) by lia.
-      done.
-        }
-        {
-          iDestruct (big_sepL_cons with "H1") as "[HPv Hrest]".
-          iMod ("Hinv_close" with "[HsentI Hoc Hrest H2 H4 Hcons_new]") as "H".
-          {
-            iNext. iFrame. iSplitR "H4 Hrest". { iPureIntro.  unfold inflight in *. rewrite <- app_assoc. done.   }
-            iFrame.
-          iApply (big_sepL_proper _ _ (v0 :: rest) with "Hrest").
-intros k y z.
-rewrite length_app.
-rewrite singleton_length.
-replace  ((length recv + 1)%nat + k)   with  (length recv + S k)  by lia.
-done.
-          }
-          iApply "Hcont". iModIntro. iFrame.
-      replace  (length recv + 0%nat)  with (Z.of_nat (length recv)) by lia.
-      done.
-        }
-      }
-      {
-        destruct rest.
-        {
-          iMod ("Hinv_close" with "[HsentI Hoc H2 H5 Hcons_new]") as "H".
-          {
-            iNext. iFrame. iSplitR "H5". { iPureIntro.  unfold inflight in *. rewrite <- app_assoc. done.   }
-            iRight. iFrame.
-          }
-          iApply "Hcont". iModIntro. iFrame.
-          iDestruct "H1" as "[HPv _]". iFrame.
-      replace  (length recv + 0%nat)  with (Z.of_nat (length recv)) by lia.
-      done.
-        }
-        {
-          iDestruct (big_sepL_cons with "H1") as "[HPv Hrest]".
-          iMod ("Hinv_close" with "[HsentI Hoc Hrest H2 H5 Hcons_new]") as "H".
-          {
-            iNext. iFrame. iSplitR "H5 Hrest". { iPureIntro.  unfold inflight in *. rewrite <- app_assoc. done.   }
-             iFrame.
-          iApply (big_sepL_proper _ _ (v0 :: rest) with "Hrest").
-intros k y z.
-rewrite length_app.
-rewrite singleton_length.
-replace  ((length recv + 1)%nat + k)   with  (length recv + S k)  by lia.
-done.
-          }
-          iApply "Hcont". iModIntro. iFrame.
-      replace  (length recv + 0%nat)  with (Z.of_nat (length recv)) by lia.
-      done.
-        }
-      }
-    }
-  }
+    iMod (dghost_var_update (recv ++ [w]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new]") as "_".
+    { iNext. iExists chanstate.RcvDone, sent, (recv ++ [w]).
+      iFrame "H1 HsentI HrecvI_new".
+      iPureIntro. rewrite Hrel. simpl. by rewrite app_nil_r. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "Hi Hcons_new".
+  - (* recv_slow_path_au : Idle -> RcvWait, then SndDone w -> Idle *)
+    iIntros "[Hlc Himpl]". sp_openc. sp_step (@chanstate.RcvWait V) Hcv2.
+    iMod ("Hclose" with "[H1 HsentI HrecvI]") as "_".
+    { iNext. iExists chanstate.RcvWait, sent, recv.
+      iFrame "H1 HsentI HrecvI". iPureIntro. rewrite Hrel. by simpl. }
+    iModIntro. iFrame "H2". try iClear "Hi".
+    (* phase two, fired once the sender has committed *)
+    iIntros (w) "[Hlc Himpl]". sp_open.
+    iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
+    sp_step (@chanstate.Idle V) Hcv3.
+    iCombine "Hcons HrecvI" as "Hrcv_full".
+    iMod (dghost_var_update (recv0 ++ [w]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new]") as "_".
+    { iNext. iExists chanstate.Idle, sent0, (recv0 ++ [w]).
+      iFrame "H1 HsentI HrecvI_new".
+      iPureIntro. rewrite Hrel0. simpl. by rewrite app_nil_r. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "Hi Hcons_new".
+  - (* recv_deq_au : take the head off the buffer *)
+    iIntros (w rest) "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
+    sp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Buffered rest) with "Hch Himpl") as "[H1 H2]".
+    { simpl in Hlen |- *. split; lia. }
+    iDestruct "Hi" as "[HPv Hrest]".
+    iCombine "Hcons HrecvI" as "Hrcv_full".
+    iMod (dghost_var_update (recv ++ [w]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new Hrest]") as "_".
+    { iNext. iExists (chanstate.Buffered rest), sent, (recv ++ [w]).
+      iFrame "H1 HsentI HrecvI_new".
+      iSplitR "Hrest".
+      { iPureIntro. rewrite Hrel. simpl. by rewrite -app_assoc. }
+      sp_reindex rest recv. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "Hcons_new".
+    replace (length recv + 0%nat) with (Z.of_nat (length recv)) by lia.
+    iFrame "HPv".
+  - (* recv_drain_au : take the head off a closed channel's drain *)
+    iIntros (w rest) "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
+    sp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iDestruct "Hi" as "(Hdrain & Hprod & Hdisj)".
+    iCombine "Hcons HrecvI" as "Hrcv_full".
+    iMod (dghost_var_update (recv ++ [w]) with "Hrcv_full") as "[HrecvI_new Hcons_new]".
+    destruct rest as [|r rs].
+    + (* last drained value *)
+      iMod (own_chan_halves_update (@chanstate.Closed V []) with "Hch Himpl") as "[H1 H2]".
+      { simpl in Hlen |- *. lia. }
+      iDestruct "Hdrain" as "[HPv _]".
+      iMod ("Hclose" with "[H1 HsentI HrecvI_new Hprod Hdisj]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent, (recv ++ [w]).
+        iFrame "H1 HsentI HrecvI_new Hprod Hdisj".
+        iPureIntro. rewrite Hrel. simpl. by rewrite app_nil_r. }
+      iModIntro. iFrame "H2". iApply "Hcont". iFrame "Hcons_new".
+      replace (length recv + 0%nat) with (Z.of_nat (length recv)) by lia.
+      iFrame "HPv".
+    + iMod (own_chan_halves_update (chanstate.Closed (r :: rs)) with "Hch Himpl")
+        as "[H1 H2]".
+      { simpl in Hlen |- *. split; lia. }
+      iDestruct "Hdrain" as "[HPv Hrest]".
+      iMod ("Hclose" with "[H1 HsentI HrecvI_new Hrest Hprod Hdisj]") as "_".
+      { iNext. iExists (chanstate.Closed (r :: rs)), sent, (recv ++ [w]).
+        iFrame "H1 HsentI HrecvI_new".
+        iSplitR "Hrest Hprod Hdisj".
+        { iPureIntro. rewrite Hrel. simpl. by rewrite -app_assoc. }
+        iFrame "Hprod Hdisj". sp_reindex (r :: rs) recv. }
+      iModIntro. iFrame "H2". iApply "Hcont". iFrame "Hcons_new".
+      replace (length recv + 0%nat) with (Z.of_nat (length recv)) by lia.
+      iFrame "HPv".
+  - (* recv_closed_au : drained and closed, so hand back R *)
+    iIntros "[Hlc Himpl]". sp_openc. sp_agree.
+    iDestruct (dghost_var_agree with "Hcons HrecvI") as %->.
+    iDestruct "Hi" as "(Hprod & [HR | Hcons2])".
+    + iMod ("Hclose" with "[Hch HsentI HrecvI Hprod Hcons]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent, recv.
+        iFrame "Hch HsentI HrecvI Hprod".
+        iSplitR; [ iPureIntro; done | ].
+        iRight. unfold spsc_consumer. rewrite Hrel. simpl.
+        rewrite app_nil_r. iFrame "Hcons". }
+      iModIntro. iFrame "Himpl". iApply "Hcont".
+      rewrite Hrel. simpl. rewrite app_nil_r. iFrame "HR". done.
+    + (* the invariant already holds the consumer half, so ours is one too many *)
+      iExFalso. unfold spsc_consumer.
+      iCombine "Hcons HrecvI" as "Hfull".
+      iDestruct (dghost_var_valid_2 with "Hfull Hcons2") as "[%Hvalid _]". done.
 Qed.
 
 (** SPSC receive operation with history tracking *)
@@ -409,7 +290,7 @@ Proof using All.
   iPoseProof "Hspsc" as "[#Hch _]".
   wp_apply (chan.wp_receive with "[$Hch]").
   iIntros "(Hlc1 & Hlc2 & _ & _)".
-  iApply (spsc_rcv_au with "[$Hspsc] [$] [$Hcons]").
+  iApply (spsc_rcv_au with "[$Hspsc] [$Hcons]").
   iNext. iFrame.
 Qed.
 
@@ -418,166 +299,77 @@ Qed.
 Lemma spsc_send_au γ ch (P : Z -> V → iProp Σ) (R : list V → iProp Σ)
                    (sent : list V) (v : V) Φ :
   is_spsc γ ch P R -∗
-  £1 ∗ £1 ∗ £1 -∗
   spsc_producer γ sent ∗ P (length sent) v -∗
   ▷ (spsc_producer γ (sent ++ [v]) -∗ Φ) -∗
-  send_au γ.(chan_name) v Φ.
+  send_au γ.(chan_name) V v Φ.
 Proof.
-  iIntros "#Hspsc (Hlc1 & Hlc2 & Hlc3) [Hprod HP] Hcont".
+  clear IntoValTyped0.
+  iIntros "#Hspsc [Hprod HP] Hcont".
   iDestruct "Hspsc" as "[Hchan Hinv]".
-
-  (* Provide the send atomic update *)
-  iMod (lc_fupd_elim_later with "Hlc1 Hcont") as "Hcont".
-
-  (* Open the SPSC invariant to provide the atomic update *)
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc2 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-
-  (* Establish agreement between our sent and invariant's sent *)
-  iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
-
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame.
-
-  (* Case analysis on channel state *)
-  destruct s; try done.
-
-  { (* Case: Buffered channel *)
-    iIntros "Hoc".
-
-    (* Update sent history *)
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au : RcvWait -> SndDone v *)
+    iIntros "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
+    sp_step (chanstate.SndDone v) Hcv1.
     iCombine "Hprod HsentI" as "Hsent_full".
     iMod (dghost_var_update (sent0 ++ [v]) with "Hsent_full") as "[HsentI_new Hprod_new]".
-
-    (* Close invariant *)
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HsentI_new HrecvI Hinv_open HP]") as "_".
-    {
-      iNext. iExists (chanstate.Buffered (buff ++ [v])), (sent0 ++ [v]), recv.
-      iFrame. simpl.
-      subst sent0. iFrame. unfold inflight. rewrite length_app.
-      replace (Z.of_nat (length recv + length buff))  with  (Z.of_nat (length recv) + Z.of_nat (length buff + 0)) by lia.
-      iFrame. iPureIntro. rewrite app_assoc. done.
-    }
-
-    (* Apply continuation *)
-    iModIntro. iApply "Hcont". unfold spsc_producer. iFrame.
-  }
-
-  { (* Case: Idle channel - need to wait for receiver *)
-    iIntros "Hoc".
-
-    (* Update sent history *)
+    iMod ("Hclose" with "[H1 HsentI_new HrecvI HP]") as "_".
+    { iNext. iExists (chanstate.SndDone v), (sent0 ++ [v]), recv.
+      iFrame "H1 HsentI_new HrecvI".
+      unfold inflight in Hrel. rewrite app_nil_r in Hrel. subst sent0.
+      iFrame "HP". iPureIntro. done. }
+    iModIntro. iFrame "H2". iApply "Hcont". unfold spsc_producer. iFrame "Hprod_new".
+  - (* send_slow_path_au : Idle -> SndWait v, then RcvDone -> Idle *)
+    iIntros "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
+    sp_step (chanstate.SndWait v) Hcv2.
     iCombine "Hprod HsentI" as "Hsent_full".
     iMod (dghost_var_update (sent0 ++ [v]) with "Hsent_full") as "[HsentI_new Hprod_new]".
-
-    iMod "Hmask".
-    iNamed "Hoc".
-    iAssert (own_chan γ.(chan_name) V (chanstate.SndPending v))%I
-      with "[Hchanrepfrag]" as "Hoc".
-    { iFrame "∗#". iPureIntro. unfold chan_cap_valid. done. }
-
-    (* Close invariant with SndPending state *)
-    iMod ("Hinv_close" with "[Hoc HsentI_new HrecvI HP]") as "_".
-    {
-      iNext. iExists (chanstate.SndPending v), (sent0 ++ [v]), recv.
-      iFrame.
-      unfold inflight in Hrel. simpl in *. rewrite app_nil_r in Hrel.
-      subst sent0. iFrame.
-      iPureIntro. done.
-    }
-
-    (* Provide send_nested_au *)
-    iModIntro. unfold send_nested_au.
-
-    iInv "Hinv" as "Hinv_open2" "Hinv_close2".
-    iMod (lc_fupd_elim_later with "[$] Hinv_open2") as "Hi".
-    iNamed "Hi".
-    iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-    iNext. iNamed "Hi". iFrame.
-    iDestruct (dghost_var_agree with "Hprod_new HsentI") as %Heq.
-
-    (* Case analysis on current state *)
-    unfold chan_cap_valid in Hcapvalid.
-    destruct s; try done.
-    {
-      (* RcvCommit case - complete handshake *)
-      iIntros "Hoc".
-      iMod "Hmask1".
-      iMod ("Hinv_close2" with "[HsentI HrecvI Hoc]") as "_".
-      {
-        iNext. iExists chanstate.Idle, sent, recv0.
-        iFrame.
-        iPureIntro. rewrite Hrel0. simpl. done.
-      }
-      iModIntro. iApply "Hcont" in "Hprod_new". done.
-    }
-    {
-      (* Closed channel - invalid (producer permission conflict) *)
-      destruct drain.
-      {
-        iDestruct "Hi" as "(Hd & Hspp)".
-        unfold spsc_producer.
-        iCombine "HsentI Hd" as "Hfull".
-        iExFalso.
-        iDestruct (dghost_var_valid_2 with "Hfull Hprod_new") as "[%Hvalid _]".
-        done.
-      }
-      {
-        iDestruct "Hi" as "(Hd & Hspp & H3)".
-        unfold spsc_producer.
-        iCombine "HsentI Hspp" as "Hfull".
-        iExFalso.
-        iDestruct (dghost_var_valid_2 with "Hfull Hprod_new") as "[%Hvalid _]".
-        done.
-      }
-    }
-  }
-
-  { (* Case: RcvPending - fast path completion *)
-    iIntros "Hoc".
-
-    (* Update sent history *)
+    iMod ("Hclose" with "[H1 HsentI_new HrecvI HP]") as "_".
+    { iNext. iExists (chanstate.SndWait v), (sent0 ++ [v]), recv.
+      iFrame "H1 HsentI_new HrecvI".
+      unfold inflight in Hrel. rewrite app_nil_r in Hrel. subst sent0.
+      iFrame "HP". iPureIntro. done. }
+    iModIntro. iFrame "H2". try iClear "Hi".
+    (* phase two, fired once the receiver has committed *)
+    iIntros "[Hlc Himpl]". sp_open.
+    iDestruct (dghost_var_agree with "Hprod_new HsentI") as %->.
+    sp_step (@chanstate.Idle V) Hcv3.
+    iMod ("Hclose" with "[H1 HsentI HrecvI]") as "_".
+    { iNext. iExists chanstate.Idle, sent, recv0.
+      iFrame "H1 HsentI HrecvI". iPureIntro. rewrite Hrel0. by simpl. }
+    iModIntro. iFrame "H2". iApply "Hcont". unfold spsc_producer. iFrame "Hprod_new".
+  - (* send_enq_au : the implementation has already checked there is room *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". sp_openc.
+    iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
+    sp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Buffered (buf ++ [v]))
+           with "Hch Himpl") as "[H1 H2]".
+    { simpl. rewrite length_app /=. lia. }
     iCombine "Hprod HsentI" as "Hsent_full".
     iMod (dghost_var_update (sent0 ++ [v]) with "Hsent_full") as "[HsentI_new Hprod_new]".
-
-    iMod "Hmask".
-
-    (* Close invariant with SndCommit state *)
-    iMod ("Hinv_close" with "[Hoc HsentI_new HrecvI HP]") as "_".
-    {
-      iNext. iExists (chanstate.SndCommit v), (sent0 ++ [v]), recv.
-      iFrame.
-      unfold inflight in Hrel. simpl in *. rewrite app_nil_r in Hrel.
-      subst sent0. iFrame.
-      iPureIntro. done.
-    }
-
-    (* Apply the final continuation *)
-    iModIntro. iApply "Hcont".
-    unfold spsc_producer. iFrame.
-  }
-
-  { (* Case: Closed channel - invalid (producer permission conflict) *)
-    destruct drain.
-    {
-      iDestruct "Hinv_open" as "(Hd & Hspp)".
-      unfold spsc_producer.
+    iMod ("Hclose" with "[H1 HsentI_new HrecvI Hi HP]") as "_".
+    { iNext. iExists (chanstate.Buffered (buf ++ [v])), (sent0 ++ [v]), recv.
+      iFrame "H1 HsentI_new HrecvI".
+      iSplitR.
+      { iPureIntro. rewrite Hrel. simpl. by rewrite app_assoc. }
+      rewrite big_sepL_app. iFrame "Hi". simpl.
+      subst sent0. cbn [inflight]. rewrite length_app.
+      replace (Z.of_nat (length recv + length buf))
+         with (Z.of_nat (length recv) + Z.of_nat (length buf + 0)) by lia.
+      iFrame "HP". }
+    iModIntro. iFrame "H2". iApply "Hcont". unfold spsc_producer. iFrame "Hprod_new".
+  - (* send_closed_au : at Closed the invariant holds the producer half too *)
+    iIntros (drain) "[Hlc Himpl]". sp_openc. sp_agree.
+    unfold spsc_producer.
+    destruct drain as [|d ds].
+    + iDestruct "Hi" as "(Hd & _)".
       iCombine "HsentI Hd" as "Hfull".
-      iExFalso.
-      iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]".
-      done.
-    }
-    {
-      iDestruct "Hinv_open" as "(Hd & Hspp & H3)".
-      unfold spsc_producer.
-      iCombine "HsentI Hspp" as "Hfull".
-      iExFalso.
-      iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]".
-      done.
-    }
-  }
+      iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]". done.
+    + iDestruct "Hi" as "(_ & Hd & _)".
+      iCombine "HsentI Hd" as "Hfull".
+      iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]". done.
 Qed.
 
 (** SPSC send operation with history tracking *)
@@ -597,55 +389,66 @@ Proof using All.
   wp_apply (chan.wp_send ch v γ.(chan_name) with "[$Hchan]").
   iIntros "(Hlc1 & Hlc2 & Hlc3 & _)".
 
-  iApply (spsc_send_au with "[$Hspsc] [$] [$Hprod $HP]").
+  iApply (spsc_send_au with "[$Hspsc] [$Hprod $HP]").
   done.
 Qed.
 
 (** ** Close Operation *)
 
+(* Close only has to consider Idle and Buffered: [tryClose] spins on every
+   pending/committed state, so those are unreachable here. *)
 Lemma spsc_close_au γ ch P R sent Φ :
   is_spsc γ ch P R -∗
-  £1 -∗
   spsc_producer γ sent ∗ R sent -∗
   ▷ Φ -∗
   close_au γ.(chan_name) V Φ.
 Proof.
-  iIntros "#Hspsc Hlc1 [Hprod HP] Hcont".
+  clear IntoValTyped0.
+  iIntros "#Hspsc [Hprod HP] Hcont".
   iDestruct "Hspsc" as "[Hchan #Hinv]".
-
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
-
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame.
-
-  destruct s; try done.
-  - (* Buffered *)
-    iIntros "Hoc". iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI HP Hprod Hinv_open]") as "_".
-    { iModIntro. iFrame. destruct buff; [iFrame|iFrame]; iPureIntro; done. }
-    iModIntro. by iApply "Hcont".
-
-  - (* Idle *)
-    iIntros "Hoc". iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI HP Hprod Hinv_open]") as "_".
-    { iModIntro. iFrame. unfold spsc_producer. iFrame. iPureIntro. done. }
-    iModIntro. by iApply "Hcont".
-
-  - (* Closed *)
-    destruct drain.
-    + unfold spsc_producer. simpl.
-      iDestruct "Hinv_open" as "[Hgv1 HR]".
-      iCombine "HsentI HrecvI" as "H".
-      iDestruct "H" as "[Hsent Hrecv]".
-      iCombine "Hgv1 Hsent" as "Hfull".
+  rewrite /close_au. repeat iSplit.
+  - (* close_idle_au : Idle -> Closed [] *)
+    iIntros "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
+    sp_step (@chanstate.Closed V []) Hcv1.
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hprod HP]") as "_".
+    { iNext. iExists (chanstate.Closed []), sent0, recv.
+      iFrame "H1 HsentI HrecvI".
+      iSplitR; [ iPureIntro; rewrite Hrel; by cbn [inflight] | ].
+      unfold spsc_producer. iFrame "Hprod". iLeft. iFrame "HP". }
+    iModIntro. iFrame "H2 Hcont".
+  - (* close_buf_au : the buffered values become the drain *)
+    iIntros (buf) "[Hlc Himpl]". sp_openc.
+    iDestruct (dghost_var_agree with "Hprod HsentI") as %->.
+    sp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    destruct buf as [|d ds].
+    + iMod (own_chan_halves_update (@chanstate.Closed V []) with "Hch Himpl")
+        as "[H1 H2]".
+      { simpl in Hlen |- *. lia. }
+      iMod ("Hclose" with "[H1 HsentI HrecvI Hprod HP]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent0, recv.
+        iFrame "H1 HsentI HrecvI".
+        iSplitR; [ iPureIntro; rewrite Hrel; by cbn [inflight] | ].
+        unfold spsc_producer. iFrame "Hprod". iLeft. iFrame "HP". }
+      iModIntro. iFrame "H2 Hcont".
+    + iMod (own_chan_halves_update (chanstate.Closed (d :: ds)) with "Hch Himpl")
+        as "[H1 H2]".
+      { simpl in Hlen |- *. split; lia. }
+      iMod ("Hclose" with "[H1 HsentI HrecvI Hi Hprod HP]") as "_".
+      { iNext. iExists (chanstate.Closed (d :: ds)), sent0, recv.
+        iFrame "H1 HsentI HrecvI".
+        iSplitR; [ iPureIntro; rewrite Hrel; by cbn [inflight] | ].
+        iFrame "Hi". unfold spsc_producer. iFrame "Hprod". iLeft. iFrame "HP". }
+      iModIntro. iFrame "H2 Hcont".
+  - (* close_closed_au : at Closed the invariant already holds the producer half *)
+    iIntros (drain) "[Hlc Himpl]". sp_openc. sp_agree.
+    unfold spsc_producer.
+    destruct drain as [|d ds].
+    + iDestruct "Hi" as "(Hgv1 & _)".
+      iCombine "Hgv1 HsentI" as "Hfull".
       iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]". done.
-
-    + unfold spsc_producer. simpl.
-      iDestruct "Hinv_open" as "[Hgv1 HR]".
-      iDestruct "HR" as "[Hgv2 HR]".
+    + iDestruct "Hi" as "(_ & Hgv2 & _)".
       iCombine "Hgv2 HsentI" as "Hfull".
       iDestruct (dghost_var_valid_2 with "Hfull Hprod") as "[%Hvalid _]". done.
 Qed.
@@ -659,8 +462,8 @@ Proof using All.
   iIntros (Φ) "( #Hspsc & Hprod & HP) Hcont".
   iPoseProof "Hspsc" as "[Hchan _]".
   iApply (chan.wp_close with "Hchan").
-  iIntros "(Hlc1 & _ & _ & _)".
-  iApply (spsc_close_au with "[$Hspsc] [$] [$Hprod $HP]").
+  iIntros "_".
+  iApply (spsc_close_au with "[$Hspsc] [$Hprod $HP]").
   iModIntro.
   by iApply "Hcont".
 Qed.

@@ -94,82 +94,75 @@ Proof.
   iDestruct 1 as "[$ _]".
 Qed.
 
+(* Open the lock-channel invariant and hand the arm the invariant's half. *)
+Local Ltac lc_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iDestruct "Hi" as (s locked) "(Hoc & %Hcap & HI)".
+(* When the client's continuation is itself latered, one credit strips both:
+   [▷A ∗ ▷B ⊣⊢ ▷(A ∗ B)].  Lemmas with an unlatered continuation use [lc_open]. *)
+Local Ltac lc_openc :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iCombine "Hi Hcont" as "Hic";
+  iMod (lc_fupd_elim_later with "Hlc Hic") as "[Hi Hcont]";
+  iDestruct "Hi" as (s locked) "(Hoc & %Hcap & HI)".
+Local Ltac lc_agree := iDestruct (own_chan_agree with "Hoc Himpl") as %->; simpl.
+(* Unbuffered and closed states are banned by the invariant. *)
+Local Ltac lc_absurd := lc_agree; iDestruct "HI" as "[]".
+
 Lemma lock_channel_send_au γ ch (v : V) (R : iProp Σ) :
   ∀ (Φ: iProp Σ),
   is_lock_channel γ ch R -∗
-  £1 -∗
   ▷ (R -∗ Φ) -∗
-  send_au γ.(lchan_name) v Φ.
+  send_au γ.(lchan_name) V v Φ.
 Proof.
-  iIntros (Φ) "#Hlock (HR & Hlc) Hcont".
+  iIntros (Φ) "#Hlock Hcont".
   iDestruct "Hlock" as "[#Hchan #Hinv]".
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au: unbuffered states are banned *)
+    iIntros "[Hlc Himpl]". lc_openc. lc_absurd.
+  - (* send_slow_path_au *)
+    iIntros "[Hlc Himpl]". lc_openc. lc_absurd.
+  - (* send_enq_au: cap = 1, so the capacity fact forces an empty buffer *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". lc_openc. lc_agree.
+    destruct buf as [|v' rest].
+    + iDestruct "HI" as "(%Hlocked & HR)".
+      iMod (own_chan_halves_update (chanstate.Buffered [v]) with "Hoc Himpl") as "[H1 H2]".
+      { simpl. rewrite Hcap. word. }
+      iMod ("Hclose" with "[H1]") as "_".
+      { iNext. iExists (chanstate.Buffered [v]), true. iFrame "H1". iFrame "%". done. }
+      iModIntro. iFrame "H2". by iApply ("Hcont" with "HR").
+    + exfalso. rewrite Hcap in Hlt. simpl in Hlt. word.
+  - (* send_closed_au *)
+    iIntros (drain) "[Hlc Himpl]". lc_openc. lc_absurd.
+Qed.
 
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "[$] [$Hinv_open]") as "Hinv_open".
-  iNamed "Hinv_open".
-
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext.
-  iExists s. iFrame "Hch".
-
-  destruct s; try done.
-  destruct buff as [|v' rest].
-  {
-    iIntros "Hoc".
-    iMod "Hmask".
-    iDestruct "Hinv_open" as "(%Hlocked & HR)".
-    iMod ("Hinv_close" with "[Hoc]") as "_".
-    {
-      iNext. iExists (chanstate.Buffered [v]). iExists true. iFrame.
-      done.
-    }
-    iModIntro. iApply "Hcont".
-    iFrame.
-  }
-  {
-    destruct rest; try done.
-    iIntros "H".
-    iDestruct (own_chan_buffer_size with "H") as "%Hbad".
-    rewrite Hcap in Hbad.
-    simpl in Hbad.
-    done.
-  }
-  Qed.
-
-Lemma lock_channel_nonblocking_send_au γ ch (v : V) (R : iProp Σ)  :
-∀ Φ,
-  is_lock_channel  γ ch R -∗
-  £1 -∗
+(* Nonblocking acquire.  Same three real obligations as the blocking version;
+   the not-ready payload is [True] because failing to acquire tells us nothing. *)
+Lemma lock_channel_nonblocking_send_au γ ch (v : V) (R : iProp Σ) :
+  ∀ Φ,
+  is_lock_channel γ ch R -∗
   (R -∗ Φ) -∗
-  nonblocking_send_au γ.(lchan_name) v Φ True.
+  nonblocking_send_au γ.(lchan_name) V v Φ True.
 Proof.
-  iIntros (Φ) "#Hlock HR HΦ".
+  iIntros (Φ) "#Hlock Hcont".
   iDestruct "Hlock" as "[#Hchan #Hinv]".
-  iSplit. all: try done.
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "[$] [$Hinv_open]") as "Hinv_open".
-  iNamed "Hinv_open".
-  destruct s. all: try done.
-  destruct buff. all: try done.
-  {
-    iDestruct "Hinv_open" as "(%H & H')".
-    subst locked.
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iExists (chanstate.Buffered []). iFrame "Hch".  iIntros "Hoc".
-  iMod "Hmask". 
-    iMod ("Hinv_close" with "[ $Hoc   ]") as "H".
-    {  iFrame "%". iNext. simpl. iExists true. done.   }
-    iModIntro. iApply "HΦ". iFrame.  
-  }
-  {
-    destruct buff. all: try done.
-  iDestruct "Hinv_open" as "%Hlt".
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame. iIntros "Hch".  
-  iMod "Hmask". 
-    iDestruct (own_chan_buffer_size with "Hch") as "%Hbad".
-    rewrite Hcap in Hbad. done.
-  }
+  rewrite /nonblocking_send_au. iSplit; [| iSplit; [| iSplit ] ].
+  - (* send_fast_path_au: unbuffered states are banned *)
+    iIntros "[Hlc Himpl]". lc_open. lc_absurd.
+  - (* send_enq_au: cap = 1, so the capacity fact forces an empty buffer *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". lc_open. lc_agree.
+    destruct buf as [|v' rest].
+    + iDestruct "HI" as "(%Hlocked & HR)".
+      iMod (own_chan_halves_update (chanstate.Buffered [v]) with "Hoc Himpl") as "[H1 H2]".
+      { simpl. rewrite Hcap. word. }
+      iMod ("Hclose" with "[H1]") as "_".
+      { iNext. iExists (chanstate.Buffered [v]), true. iFrame "H1". iFrame "%". done. }
+      iModIntro. iFrame "H2". by iApply ("Hcont" with "HR").
+    + exfalso. rewrite Hcap in Hlt. simpl in Hlt. word.
+  - (* send_closed_au: this idiom never closes *)
+    iIntros (drain) "[Hlc Himpl]". lc_open. lc_absurd.
+  - done.
 Qed.
 
 Lemma wp_lock_channel_lock γ ch (v:V) (R : iProp Σ) :
@@ -177,18 +170,11 @@ Lemma wp_lock_channel_lock γ ch (v:V) (R : iProp Σ) :
     chan.send t #ch #v
   {{{ RET #(); R }}}.
 Proof.
-  iIntros (Φ) "(#Hlock & HR) Hcont".
-
+  iIntros (Φ) "#Hlock Hcont".
   iNamed "Hlock".
-
   wp_apply (chan.wp_send ch v γ.(lchan_name) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2 & Hlc3 & Hlc4)".
-  iNamed "HR".
-
-  iApply (lock_channel_send_au with "[$Hinv] [$Hlc1] [Hcont]").
-  {
-    iFrame "#".
-  }
+  iIntros "_".
+  iApply (lock_channel_send_au with "[$Hchan $Hinv]").
   iNext. iFrame.
 Qed.
 
@@ -196,38 +182,29 @@ Lemma lock_channel_recv_au γ ch (R : iProp Σ) :
   ∀ Φ,
   is_lock_channel γ ch R -∗
   R -∗
-  £1 -∗
-  ▷ (∀ v, True -∗ Φ v true) -∗
-  recv_au γ.(lchan_name) V (λ (v:V) true, Φ v true).
+  ▷ (∀ v, Φ v true) -∗
+  recv_au γ.(lchan_name) V Φ.
 Proof.
-  iIntros (Φ) "#Hislock HR Hlc HΦcont".
-
-
-  unfold recv_au.
-  unfold is_lock_channel.
-  iNamed "Hislock".
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iDestruct "Hlc" as "[Hlc1 Hrest]".
-  iMod (lc_fupd_elim_later with "[$] [$Hinv_open]") as "Hinv_open".
-  iNamed "Hinv_open".
-
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext.
-  iExists s. iFrame "Hch".
-
-  destruct s; try done.
-  destruct buff as [|v [|? ?]]; try done.
-
-  (* Value in buffer - can unlock *)
-  iIntros "Hoc".
-  iMod "Hmask".
-  iMod ("Hinv_close" with "[Hoc HR]") as "_".
-  {
-    iNext. iExists (chanstate.Buffered []). iFrame.
-    iExists false. iFrame.
-    iPureIntro. done.
-  }
-  iModIntro. iApply "HΦcont". done.
+  iIntros (Φ) "#Hlock HR Hcont".
+  iDestruct "Hlock" as "[#Hchan #Hinv]".
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au *)
+    iIntros (w) "[Hlc Himpl]". lc_openc. lc_absurd.
+  - (* recv_slow_path_au *)
+    iIntros "[Hlc Himpl]". lc_openc. lc_absurd.
+  - (* recv_deq_au: the buffer holds exactly the one token *)
+    iIntros (w rest) "[Hlc Himpl]". lc_openc. lc_agree.
+    destruct rest as [|? ?]; last (iDestruct "HI" as "[]").
+    iDestruct "HI" as "%Hlocked".
+    iMod (own_chan_halves_update (@chanstate.Buffered V []) with "Hoc Himpl") as "[H1 H2]".
+    { simpl. rewrite Hcap. word. }
+    iMod ("Hclose" with "[H1 HR]") as "_".
+    { iNext. iExists (chanstate.Buffered []), false. iFrame "H1". iFrame "%". by iFrame. }
+    iModIntro. iFrame "H2". by iApply "Hcont".
+  - (* recv_drain_au *)
+    iIntros (w rest) "[Hlc Himpl]". lc_openc. lc_absurd.
+  - (* recv_closed_au *)
+    iIntros "[Hlc Himpl]". lc_openc. lc_absurd.
 Qed.
 
 Lemma wp_lock_channel_unlock γ ch (R : iProp Σ) :
@@ -240,9 +217,9 @@ Proof.
   iDestruct "Hlock" as "[#Hchan #Hinv]".
 
   iApply (chan.wp_receive ch γ.(lchan_name) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2)".
-  iApply ((lock_channel_recv_au γ ch R) with "[$Hchan $Hinv] [$HR] [$Hlc1]").
-  iNext. iFrame.
+  iIntros "_".
+  iApply ((lock_channel_recv_au γ ch R) with "[$Hchan $Hinv] [$HR]").
+  iNext. iIntros (w). iApply "Hcont". done.
 Qed.
 
 End lock_channel.

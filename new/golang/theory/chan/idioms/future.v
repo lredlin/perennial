@@ -105,9 +105,9 @@ Definition is_future (γ : future_names) (ch : loc) : iProp Σ :=
       "Hch" ∷ own_chan  γ.(chan_name) V s ∗
       match s with
       | chanstate.Buffered msgs => [∗ list] v ∈ msgs, Fulfilled γ v
-      | chanstate.SndPending v => Fulfilled γ v
-      | chanstate.SndCommit v => Fulfilled γ v
-      | chanstate.Idle | chanstate.RcvPending | chanstate.RcvCommit => True
+      | chanstate.SndWait v => Fulfilled γ v
+      | chanstate.SndDone v => Fulfilled γ v
+      | chanstate.Idle | chanstate.RcvWait | chanstate.RcvDone => True
       | _ => False
       end
   )%I.
@@ -179,9 +179,9 @@ Proof.
       "Hch" ∷ own_chan γ V s' ∗
       match s' with
       | chanstate.Buffered msgs => [∗ list] v ∈ msgs, Fulfilled γmf v
-      | chanstate.SndPending v => Fulfilled γmf v
-      | chanstate.SndCommit v => Fulfilled γmf v
-      | chanstate.Idle | chanstate.RcvPending | chanstate.RcvCommit => True
+      | chanstate.SndWait v => Fulfilled γmf v
+      | chanstate.SndDone v => Fulfilled γmf v
+      | chanstate.Idle | chanstate.RcvWait | chanstate.RcvDone => True
       | _ => False
       end
   )%I with "[Hoc]") as "#Hinv".
@@ -226,58 +226,63 @@ Lemma future_alloc_promise γ ch (contract : V → iProp Σ)
     iFrame.
 Qed.
 
+(* Open the future invariant and hand the arm the invariant's half. *)
+Local Ltac fu_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iDestruct "Hi" as (s) "[Hoc HI]".
+(* One credit strips the invariant body and the client's continuation together:
+   [▷A ∗ ▷B ⊣⊢ ▷(A ∗ B)].  Phase two of a two-phase arm uses [fu_open], since
+   the continuation was already stripped in phase one. *)
+Local Ltac fu_openc :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iCombine "Hi Hau" as "Hic";
+  iMod (lc_fupd_elim_later with "Hlc Hic") as "[Hi Hau]";
+  iDestruct "Hi" as (s) "[Hoc HI]".
+Local Ltac fu_agree := iDestruct (own_chan_agree with "Hoc Himpl") as %->; simpl.
+(* Closed states are banned by the invariant. *)
+Local Ltac fu_absurd := fu_agree; iDestruct "HI" as "[]".
+Local Ltac fu_step st :=
+  fu_agree;
+  iDestruct (own_chan_cap_valid with "Himpl") as %?;
+  iMod (own_chan_halves_update st with "Hoc Himpl") as "[H1 H2]";
+  [ simpl in *; lia | ].
+
 Lemma future_fulfill_au γ ch (v : V) :
   ∀ (Φ: iProp Σ),
   is_future γ ch -∗
-  £1 ∗ £1 ∗ £1 ∗ Fulfilled γ v -∗
+  Fulfilled γ v -∗
   ▷ (True -∗ Φ) -∗
-  send_au γ.(chan_name) v Φ.
+  send_au γ.(chan_name) V v Φ.
 Proof.
-  iIntros (Φ) "#Hmf (Hlc1 & Hlc2 & Hlc3 & HFulfilled) Hau".
-  rewrite /is_future.
-  iDestruct "Hmf" as "[#Hisch #Hinv]".
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iExists s. iFrame "Hch".
-  destruct s; try done.
-  - iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc Hinv_open HFulfilled]") as "_".
-    {
-      iNext. iFrame.
-      rewrite big_sepL_app. iFrame. simpl. done.
-    }
-    iModIntro. iApply "Hau". done.
-  - iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HFulfilled]") as "_".
-    {
-      iNext. iExists (chanstate.SndPending v). iFrame.
-    }
-    iModIntro.
-    unfold send_nested_au.
-    iInv "Hinv" as "Hinv_open2" "Hinv_close2".
-    iMod (lc_fupd_elim_later with "Hlc2 Hinv_open2") as "Hinv_open2".
-    iNamed "Hinv_open2".
-    iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask2"].
-    iNext. iExists s. iFrame "Hch".
-    destruct s; try done.
-    + iIntros "Hoc".
-      iMod "Hmask2".
-      iMod ("Hinv_close2" with "[Hoc Hinv_open2]") as "_".
-      {
-        iNext. iExists chanstate.Idle. iFrame.
-      }
-      iModIntro. iApply "Hau". done.
-  - iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HFulfilled]") as "_".
-    {
-      iNext. iExists (chanstate.SndCommit v). iFrame.
-    }
-    iModIntro. iApply "Hau". done.
+  iIntros (Φ) "#Hmf HFulfilled Hau".
+  rewrite /is_future. iDestruct "Hmf" as "[#Hisch #Hinv]".
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au: RcvWait -> SndDone v *)
+    iIntros "[Hlc Himpl]". fu_openc. fu_step (chanstate.SndDone v).
+    iMod ("Hclose" with "[H1 HFulfilled]") as "_".
+    { iNext. iExists (chanstate.SndDone v). iFrame. }
+    iModIntro. iFrame. by iApply "Hau".
+  - (* send_slow_path_au: Idle -> SndWait v, then RcvDone -> Idle *)
+    iIntros "[Hlc Himpl]". fu_openc. fu_step (chanstate.SndWait v).
+    iMod ("Hclose" with "[H1 HFulfilled]") as "_".
+    { iNext. iExists (chanstate.SndWait v). iFrame. }
+    iModIntro. iFrame. try iClear "HI".
+    iIntros "[Hlc Himpl]". fu_open. fu_step (@chanstate.Idle V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.Idle. by iFrame. }
+    iModIntro. iFrame. by iApply "Hau".
+  - (* send_enq_au *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". fu_openc. fu_agree.
+    iMod (own_chan_halves_update (chanstate.Buffered (buf ++ [v])) with "Hoc Himpl")
+      as "[H1 H2]".
+    { simpl. rewrite length_app /=. lia. }
+    iMod ("Hclose" with "[H1 HI HFulfilled]") as "_".
+    { iNext. iExists (chanstate.Buffered (buf ++ [v])).
+      rewrite big_sepL_app /=. iFrame. }
+    iModIntro. iFrame. by iApply "Hau".
+  - (* send_closed_au: this idiom never closes *)
+    iIntros (drain) "[Hlc Himpl]". fu_openc. fu_absurd.
 Qed.
 
 Lemma wp_future_fulfill γ ch (v : V) :
@@ -289,8 +294,8 @@ Proof.
   rewrite /is_future.
   iDestruct "Hmf" as "[#Hch #Hinv]".
   iApply (chan.wp_send ch v γ.(chan_name) with "[$Hch]").
-  iIntros "(Hlc1 & Hlc2 & Hlc3 & _)".
-  iApply (future_fulfill_au with "[$Hch $Hinv] [$Hlc1 $Hlc2 $Hlc3 $HFulfilled]").
+  iIntros "_".
+  iApply (future_fulfill_au with "[$Hch $Hinv] [$HFulfilled]").
   done.
 Qed.
 
@@ -303,15 +308,15 @@ Lemma future_await_au γ ch
     (pending : list (V → iProp Σ)) :
   ∀ (Φ: V → bool → iProp Σ),
   is_future γ ch -∗
-  £1 ∗ £1 ∗ £1 ∗ Await γ pending -∗
+  £1 ∗ Await γ pending -∗
   ▷ (∀ (v : V) (P : V → iProp Σ) (pre post : list (V → iProp Σ)),
       ⌜pending = pre ++ P :: post⌝ -∗
       P v -∗
       Await γ (pre ++ post) -∗
       Φ v true) -∗
-  recv_au γ.(chan_name) V (λ (v:V) (ok:bool), Φ v ok).
+  recv_au γ.(chan_name) V Φ.
 Proof.
-  iIntros (Φ) "#Hmf (Hlc1 & Hlc2 & Hlc3 & HAwait) Hau".
+  iIntros (Φ) "#Hmf (Hlc0 & HAwait) Hau".
   rewrite /is_future.
   iDestruct "Hmf" as "[#isHch #Hinv]".
 
@@ -351,54 +356,37 @@ Proof.
     by symmetry.
   }
 
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iExists s. iFrame "Hch".
-  destruct s; try done.
-  - (* Buffered *)
-    destruct buff as [|v_rcv msgs'] eqn:Hmsgs; simpl.
-    + done.
-    + iDestruct "Hinv_open" as "[HFulfilled_v HFulfilleds]".
-      iIntros "Hoc".
-      iMod "Hmask".
-      iMod ("Hinv_close" with "[Hoc HFulfilleds]") as "_".
-      { iNext. iExists (chanstate.Buffered msgs'). iFrame. }
-      iMod ("Hmatch" with "Hlc3 HFulfilled_v HAwait")
-        as (P pre post) "(%Hsplit & HP & HAwait')".
-      iModIntro.
-      iApply ("Hau" with "[%] HP HAwait'"). done.
-  - (* RcvPending *)
-    iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc]") as "_".
-    { iNext. iExists chanstate.RcvPending. iFrame. }
-    iModIntro.
-    iInv "Hinv" as "Hinv_open2" "Hinv_close2".
-    iMod (lc_fupd_elim_later with "Hlc2 Hinv_open2") as "Hinv_open2".
-    iNamed "Hinv_open2".
-    iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask2"].
-    iNext. iExists s. iFrame "Hch".
-    destruct s; try done.
-    +
-      iIntros "Hoc".
-      iMod "Hmask2".
-      iMod ("Hinv_close2" with "[Hoc]") as "_".
-      { iNext. iExists chanstate.Idle. iFrame. }
-      iMod ("Hmatch" with "Hlc3 Hinv_open2 HAwait")
-        as (P pre post) "(%Hsplit & HP & HAwait')".
-      iModIntro.
-      iApply ("Hau" with "[%] HP HAwait'"). done.
-  -
-    iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc]") as "_".
-    { iNext. iFrame. }
-    iMod ("Hmatch" with "Hlc3 Hinv_open HAwait")
-      as (P pre post) "(%Hsplit & HP & HAwait')".
-    iModIntro.
-    iApply ("Hau" with "[%] HP HAwait'"). done.
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au: SndWait w -> RcvDone *)
+    iIntros (w) "[Hlc Himpl]". fu_openc. fu_step (@chanstate.RcvDone V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.RcvDone. by iFrame. }
+    iMod ("Hmatch" with "Hlc0 HI HAwait") as (P pre post) "(%Hsplit & HP & HAwait')".
+    iModIntro. iFrame "H2". iApply ("Hau" with "[%] HP HAwait'"). done.
+  - (* recv_slow_path_au: Idle -> RcvWait, then SndDone w -> Idle *)
+    iIntros "[Hlc Himpl]". fu_openc. fu_step (@chanstate.RcvWait V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.RcvWait. by iFrame. }
+    iModIntro. iFrame "H2". try iClear "HI".
+    iIntros (w) "[Hlc Himpl]". fu_open. fu_step (@chanstate.Idle V).
+    iMod ("Hclose" with "[H1]") as "_".
+    { iNext. iExists chanstate.Idle. by iFrame. }
+    iMod ("Hmatch" with "Hlc0 HI HAwait") as (P pre post) "(%Hsplit & HP & HAwait')".
+    iModIntro. iFrame "H2". iApply ("Hau" with "[%] HP HAwait'"). done.
+  - (* recv_deq_au *)
+    iIntros (w rest) "[Hlc Himpl]". fu_openc. fu_agree.
+    iDestruct "HI" as "[HFul HRest]".
+    iDestruct (own_chan_cap_valid with "Himpl") as %?.
+    iMod (own_chan_halves_update (chanstate.Buffered rest) with "Hoc Himpl") as "[H1 H2]".
+    { simpl in *. lia. }
+    iMod ("Hclose" with "[H1 HRest]") as "_".
+    { iNext. iExists (chanstate.Buffered rest). iFrame. }
+    iMod ("Hmatch" with "Hlc0 HFul HAwait") as (P pre post) "(%Hsplit & HP & HAwait')".
+    iModIntro. iFrame "H2". iApply ("Hau" with "[%] HP HAwait'"). done.
+  - (* recv_drain_au: this idiom never closes *)
+    iIntros (w rest) "[Hlc Himpl]". fu_openc. fu_absurd.
+  - (* recv_closed_au *)
+    iIntros "[Hlc Himpl]". fu_openc. fu_absurd.
 Qed.
 
 Lemma wp_future_await γ ch
@@ -414,7 +402,7 @@ Proof.
   iDestruct "Hmf" as "[#Hch #Hinv]".
   iApply (chan.wp_receive ch γ.(chan_name) with "[$Hch]").
   iIntros "(Hlc1 & Hlc2 & Hlc3 & Hlc4)".
-  iApply (future_await_au with "[$Hch $Hinv] [$Hlc1 $Hlc2 $Hlc3 $HAwait]").
+  iApply (future_await_au with "[$Hch $Hinv] [$Hlc1 $HAwait]").
   iNext. iIntros (v P pre post) "%Hsplit HP HAwait".
   iApply ("HΦ" $! v P pre post).
   iFrame. done.

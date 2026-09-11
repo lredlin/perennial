@@ -67,7 +67,7 @@ Proof using W.
       iModIntro. unfold chan_inv_inner.
       iDestruct "Hsl" as "[Hsl Hos]".
 
-      iExists (Buffered []). simpl.
+      iExists (chanphys.Buffered []). simpl.
       iFrame "#∗".
 
       iPureIntro.
@@ -116,7 +116,7 @@ Proof using W.
     {
       iModIntro. unfold chan_inv_inner.
       iDestruct "Hsl" as "[Hsl Hos]".
-      iExists (@Idle V).   simpl.
+      iExists (@chanphys.Idle V).   simpl.
       iFrame "#". iFrame.
       iPureIntro.
       rewrite /chan_cap_valid //.

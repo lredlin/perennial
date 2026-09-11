@@ -177,10 +177,18 @@ Proof.
   iModIntro. done.
 Qed.
 
-Definition is_closed (γ:mpmc_names) : iProp Σ :=
+(** [is_drained γ] says the channel is closed *and every sent value has been
+    received* -- i.e. the logical state has reached [chanstate.Closed []].  It is
+    NOT "close was called": the invariant below persists this flag only at
+    [Closed []], so closing a buffered channel that still holds values leaves it
+    unset, and [recv_drain_au] sets it when a receiver takes the last value.
+    This is why [wp_mpmc_close] cannot hand it back, and why
+    [mpmc_get_final_resource] demands it: [R] is the final resource, which
+    cannot be available while values are still in flight. *)
+Definition is_drained (γ:mpmc_names) : iProp Σ :=
   dghost_var γ.(mpmc_closed_name) DfracDiscarded true.
 
-Global Instance is_closed_persistent γ : Persistent (is_closed γ) := _.
+Global Instance is_drained_persistent γ : Persistent (is_drained γ) := _.
 
 Definition mpmc_producer (γ:mpmc_names) (sent:gmultiset V) : iProp Σ :=
   client γ.(mpmc_sent_name) sent.
@@ -191,7 +199,7 @@ Definition mpmc_consumer (γ:mpmc_names) (received:gmultiset V) : iProp Σ :=
 Definition inflight_mset (s : chanstate.t V) : gmultiset V :=
   match s with
   | chanstate.Buffered buff => list_to_set_disj buff
-  | chanstate.SndPending v | chanstate.SndCommit v => {[+ v +]}
+  | chanstate.SndWait v | chanstate.SndDone v => {[+ v +]}
   | chanstate.Closed drain => list_to_set_disj drain
   | _ => ∅
   end.
@@ -213,8 +221,8 @@ Definition is_mpmc (γ:mpmc_names) (ch:loc) (n_prod n_cons:nat)
                      end) ∗
         (match s with
         | chanstate.Buffered buff => "Hbuff" ∷ [∗ list] v ∈ buff, P v
-        | chanstate.SndPending v => "HPv" ∷ P v
-        | chanstate.SndCommit v => "HPv" ∷ P v
+        | chanstate.SndWait v => "HPv" ∷ P v
+        | chanstate.SndDone v => "HPv" ∷ P v
         | chanstate.Closed [] =>
             "%Hsent_recv" ∷ ⌜sent = recv⌝ ∗
             "Hprods" ∷ (∃ prods : list (gmultiset V), ⌜length prods = n_prod⌝ ∗
@@ -276,8 +284,8 @@ Proof.
                      end) ∗
         (match s with
         | chanstate.Buffered buff => "Hbuff" ∷ [∗ list] v ∈ buff, P v
-        | chanstate.SndPending v => "HPv" ∷ P v
-        | chanstate.SndCommit v => "HPv" ∷ P v
+        | chanstate.SndWait v => "HPv" ∷ P v
+        | chanstate.SndDone v => "HPv" ∷ P v
         | chanstate.Closed [] =>
             "%Hsent_recv" ∷ ⌜sent = recv⌝ ∗
             "Hprods" ∷ (∃ prods : list (gmultiset V), ⌜length prods = n_prod⌝ ∗
@@ -328,8 +336,8 @@ Proof.
                      end) ∗
         (match s with
         | chanstate.Buffered buff => "Hbuff" ∷ [∗ list] v ∈ buff, P v
-        | chanstate.SndPending v => "HPv" ∷ P v
-        | chanstate.SndCommit v => "HPv" ∷ P v
+        | chanstate.SndWait v => "HPv" ∷ P v
+        | chanstate.SndDone v => "HPv" ∷ P v
         | chanstate.Closed [] =>
             "%Hsent_recv" ∷ ⌜sent = recv⌝ ∗
             "Hprods" ∷ (∃ prods : list (gmultiset V), ⌜length prods = n_prod⌝ ∗
@@ -367,188 +375,101 @@ Proof.
   }
 Qed.
 
+(* Open the mpmc invariant and hand the arm the invariant's half of [own_chan]. *)
+Local Ltac mp_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iNamed "Hi".
+(* One credit strips the invariant body and the client's continuation together:
+   [▷A ∗ ▷B ⊣⊢ ▷(A ∗ B)].  Phase two of a two-phase arm uses [mp_open], since
+   the continuation was already stripped in phase one. *)
+Local Ltac mp_openc :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iCombine "Hi Hcont" as "Hic";
+  iMod (lc_fupd_elim_later with "Hlc Hic") as "[Hi Hcont]";
+  iNamed "Hi".
+Local Ltac mp_agree := iDestruct (own_chan_agree with "Hch Himpl") as %->; simpl.
+(* [h] names the capacity fact read off the half the arm was handed; it is
+   what discharges [chan_cap_valid] for the post-state. *)
+Local Ltac mp_step st h :=
+  mp_agree;
+  iDestruct (own_chan_cap_valid with "Himpl") as %h;
+  iMod (own_chan_halves_update st with "Hch Himpl") as "[H1 H2]";
+  [ simpl in h |- *; lia | ].
+
+(* No later credits needed: each conjunct names a concrete pre-state, so the
+   invariant is reconciled by agreement with the half the arm is handed. *)
 Lemma mpmc_send_au γ ch (n_prod n_cons:nat) (P : V → iProp Σ) (R : gmultiset V → iProp Σ)
                    (sent : gmultiset V) (v : V) Φ :
   is_mpmc γ ch n_prod n_cons P R -∗
-  £1 ∗ £1 -∗
   mpmc_producer γ sent ∗ P v -∗
   ▷(mpmc_producer γ (sent ⊎ {[+ v +]}) -∗ Φ) -∗
-  send_au γ.(mpmc_chan_name) v Φ.
+  send_au γ.(mpmc_chan_name) V v Φ.
 Proof.
   clear IntoValTyped0.
-  iIntros "#Hmpmc (Hlc1 & Hlc2) [Hprod HP] Hcont".
+  iIntros "#Hmpmc [Hprod HP] Hcont".
   iDestruct "Hmpmc" as "[Hchan Hinv]".
-
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  iDestruct (server_agree with "HsentI Hprod") as %[Hn_pos Hsub].
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame "Hch".
-  destruct s; try done.
-  {
-    iIntros "Hoc".
-    unfold mpmc_producer.
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au : RcvWait -> SndDone v *)
+    iIntros "[Hlc Himpl]". mp_openc. mp_step (chanstate.SndDone v) Hcv1.
     iMod (update_client γ.(mpmc_sent_name) n_prod sent0 sent
                        (sent0 ⊎ {[+ v +]}) (sent ⊎ {[+ v +]})
            with "HsentI Hprod") as "[HsentI Hprod]".
     { apply gmultiset_disj_union_local_update. }
-    iMod "Hmask".
-    iNamed "Hinv_open".
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hclosed HP Hbuff]") as "_".
-    {
-      iNext. iExists (chanstate.Buffered (buff ++ [v])), (sent0 ⊎ {[+ v +]}), recv.
-      iFrame "Hoc HsentI HrecvI Hclosed".
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed HP]") as "_".
+    { iNext. iExists (chanstate.SndDone v), (sent0 ⊎ {[+ v +]}), recv.
+      iFrame "H1 HsentI HrecvI Hclosed HP".
+      iPureIntro. split_and!; try done.
+      simpl in Hrel |- *. multiset_solver. }
+    iModIntro. iFrame "H2". by iApply ("Hcont" with "Hprod").
+  - (* send_slow_path_au : Idle -> SndWait v, then RcvDone -> Idle *)
+    iIntros "[Hlc Himpl]". mp_openc. mp_step (chanstate.SndWait v) Hcv2.
+    iMod (update_client γ.(mpmc_sent_name) n_prod sent0 sent
+                       (sent0 ⊎ {[+ v +]}) (sent ⊎ {[+ v +]})
+           with "HsentI Hprod") as "[HsentI Hprod]".
+    { apply gmultiset_disj_union_local_update. }
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed HP]") as "_".
+    { iNext. iExists (chanstate.SndWait v), (sent0 ⊎ {[+ v +]}), recv.
+      iFrame "H1 HsentI HrecvI Hclosed HP".
+      iPureIntro. split_and!; try done.
+      simpl in Hrel |- *. multiset_solver. }
+    iModIntro. iFrame "H2". try iClear "Hi".
+    (* phase two, fired once the receiver has committed *)
+    iIntros "[Hlc Himpl]". mp_open. mp_step (@chanstate.Idle V) Hcv3.
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed]") as "_".
+    { iNext. iExists chanstate.Idle, sent1, recv0.
+      iFrame "H1 HsentI HrecvI Hclosed".
+      iPureIntro. split_and!; try done. }
+    iModIntro. iFrame "H2". by iApply ("Hcont" with "Hprod").
+  - (* send_enq_au : the implementation has already checked there is room *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". mp_openc. mp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Buffered (buf ++ [v]))
+           with "Hch Himpl") as "[H1 H2]".
+    { simpl. rewrite length_app /=. lia. } iNamed "Hi".
+    iMod (update_client γ.(mpmc_sent_name) n_prod sent0 sent
+                       (sent0 ⊎ {[+ v +]}) (sent ⊎ {[+ v +]})
+           with "HsentI Hprod") as "[HsentI Hprod]".
+    { apply gmultiset_disj_union_local_update. }
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed HP Hbuff]") as "_".
+    { iNext. iExists (chanstate.Buffered (buf ++ [v])), (sent0 ⊎ {[+ v +]}), recv.
+      iFrame "H1 HsentI HrecvI Hclosed".
       iSplitR.
-      {
-        iPureIntro. rewrite Hrel. unfold inflight_mset.
-        rewrite list_to_set_disj_app /=.
-        rewrite gmultiset_disj_union_right_id gmultiset_disj_union_assoc.
-        reflexivity.
-      }
-      simpl. iFrame "Hbuff HP".
-      iFrame. simpl.
-      iPureIntro.
-      done.
-    }
-    iModIntro. by iApply "Hcont".
-  }
-  {
-    iIntros "Hoc".
-    unfold mpmc_producer.
-    iMod (update_client γ.(mpmc_sent_name) n_prod sent0 sent
-                       (sent0 ⊎ {[+ v +]}) (sent ⊎ {[+ v +]})
-           with "HsentI Hprod") as "[HsentI Hprod]".
-    { apply gmultiset_disj_union_local_update. }
-    iMod "Hmask".
-    iNamed "Hoc".
-    iAssert (own_chan γ.(mpmc_chan_name) V (chanstate.SndPending v))%I
-      with "[Hchanrepfrag]" as "Hoc".
-    { iFrame "∗#". iPureIntro. unfold chan_cap_valid. done. }
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hclosed HP]") as "_".
-    {
-      iNext. iExists (chanstate.SndPending v), (sent0 ⊎ {[+ v +]}), recv.
-      iFrame "Hoc HsentI HrecvI Hclosed".
-      iSplitR.
-      { iPureIntro. rewrite Hrel. unfold inflight_mset. set_solver. }
-      simpl. iFrame "HP".
-      iPureIntro. done.
-    }
-    iModIntro. unfold send_nested_au.
-    iInv "Hinv" as "Hinv_open2" "Hinv_close2".
-    iMod (lc_fupd_elim_later with "Hlc2 Hinv_open2") as "Hinv_open2".
-    iNamed "Hinv_open2".
-    destruct s; try (iFrame;done).
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-    }
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-    }
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-    }
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-    }
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-    }
-    {
-      iApply fupd_mask_intro; [solve_ndisj | iIntros "Hmask1"].
-      iNext.
-      iNamed "Hinv_open2".
-      iFrame.
-      iIntros "Hoc".
-      iMod "Hmask1".
-      iMod ("Hinv_close2" with "[HsentI HrecvI Hoc Hclosed]") as "_".
-      {
-        iNext. iExists chanstate.Idle, sent1, recv0.
-        iFrame "Hoc HsentI HrecvI Hclosed".
-        iPureIntro. rewrite Hrel0. simpl. done.
-      }
-      iModIntro. by iApply "Hcont".
-    }
-    {
-      destruct drain.
-      - iNamed "Hinv_open2".
-        unfold mpmc_producer.
-        iNamed "Hprods".
-        iDestruct "Hprods" as "[%H1 Hprods]".
-        subst n_prod.
-        iExists (chanstate.Closed []).
-        iFrame "Hch".
-        iMod (bulk_dealloc_all with "HsentI Hprods") as "[Hserver0 _]".
-        iFrame.
-        destruct prods as [|p ps]; first (simpl in *;lia).
-        iDestruct (server_agree with "Hserver0 Hprod") as %[Hcontra _].
-        done.
-      - iNamed "Hinv_open2".
-        unfold mpmc_producer.
-        iNamed "Hprods".
-        iDestruct "Hprods" as "[%H1 Hprods]".
-        subst n_prod.
-        iMod (bulk_dealloc_all with "HsentI Hprods") as "[Hserver0 _]".
-        iFrame.
-        destruct prods as [|p ps]; first (simpl in *;lia).
-        iDestruct (server_agree with "Hserver0 Hprod") as %[Hcontra _].
-        done.
-    }
-  }
-  {
-    iMod "Hmask".
-    iNamed "Hinv_open". iIntros "Hoc".
-    iMod (update_client γ.(mpmc_sent_name) n_prod sent0 sent
-                       (sent0 ⊎ {[+ v +]}) (sent ⊎ {[+ v +]})
-           with "HsentI Hprod") as "[HsentI Hprod]".
-    { apply gmultiset_disj_union_local_update. }
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hclosed HP]") as "_".
-    {
-      iNext. iFrame. iFrame "HP". iFrame. iPureIntro. subst sent0.
-      unfold inflight_mset. simpl. set_solver.
-    }
-    {
-      iModIntro. iApply "Hcont". iFrame.
-    }
-  }
-  {
-    destruct drain.
-    - iNamed "Hinv_open".
-      unfold mpmc_producer.
-      iNamed "Hprods".
-      iDestruct "Hprods" as "[%H1 Hprods]".
-      subst n_prod.
-      iMod (bulk_dealloc_all with "HsentI Hprods") as "[Hserver0 _]".
-      iFrame.
-      destruct prods as [|p ps]; first (simpl in *;lia).
-      iDestruct (server_agree with "Hserver0 Hprod") as %[Hcontra _].
-      done.
-    - iNamed "Hinv_open".
-      unfold mpmc_producer.
-      iNamed "Hprods".
-      iDestruct "Hprods" as "[%H1 Hprods]".
-      subst n_prod.
-      iMod (bulk_dealloc_all with "HsentI Hprods") as "[Hserver0 _]".
-      iFrame.
-      destruct prods as [|p ps]; first (simpl in *;lia).
-      iDestruct (server_agree with "Hserver0 Hprod") as %[Hcontra _].
-      done.
-  }
+      { iPureIntro. rewrite Hrel. simpl.
+        rewrite list_to_set_disj_app /=. multiset_solver. }
+      simpl. rewrite big_sepL_app /=. iFrame "Hbuff HP". iFrame "%". }
+    iModIntro. iFrame "H2". by iApply ("Hcont" with "Hprod").
+  - (* send_closed_au : at Closed the invariant holds every producer client, so
+       our own [mpmc_producer] is one client too many.  NOTE: [server_agree]
+       needs its carrier passed explicitly -- left implicit, resolving
+       [contributionG Σ ?A] diverges and the proof never terminates. *)
+    iIntros (drain) "[Hlc Himpl]". mp_openc. mp_agree.
+    destruct drain as [|d ds]; unfold mpmc_producer; iNamed "Hi"; iNamed "Hprods";
+      iDestruct "Hprods" as "[%Hlen Hprods]"; subst n_prod;
+      iMod (bulk_dealloc_all with "HsentI Hprods") as "[Hserver0 _]";
+      (destruct prods as [|p ps]; first (simpl in Hnprod; lia));
+      iDestruct (server_agree γ.(mpmc_sent_name) 0 (∅ : gmultiset V) sent
+                  with "Hserver0 Hprod") as %[Hcontra _]; done.
 Qed.
 
 Lemma wp_mpmc_send γ ch (n_prod n_cons:nat) (P : V → iProp Σ) (R : gmultiset V → iProp Σ)
@@ -562,221 +483,130 @@ Proof using W.
   iIntros (Φ) "(#Hmpmc & Hprod & HP) Hcont".
   unfold is_mpmc. iPoseProof "Hmpmc" as "[#Hchan _]".
   iApply (chan.wp_send ch v γ.(mpmc_chan_name) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2 & _ & _)".
-  iApply (mpmc_send_au with "[$Hmpmc] [$] [$Hprod $HP]").
+  iIntros "_".
+  iApply (mpmc_send_au with "[$Hmpmc] [$Hprod $HP]").
   done.
 Qed.
 
 Lemma mpmc_rcv_au γ ch (n_prod n_cons:nat) (P : V → iProp Σ) (R : gmultiset V → iProp Σ)
                       (received : gmultiset V) Φ :
   is_mpmc γ ch n_prod n_cons P R -∗
-  £1 ∗ £1 -∗
   mpmc_consumer γ received -∗
   ▷(∀ (v: V) (ok: bool),
     (if ok
       then P v ∗ mpmc_consumer γ (received ⊎ {[+ v +]})
-      else is_closed γ ∗ mpmc_consumer γ received ∗ ⌜ v = (zero_val V) ⌝ ) -∗ Φ v ok) -∗
+      else is_drained γ ∗ mpmc_consumer γ received ∗ ⌜ v = (zero_val V) ⌝ ) -∗ Φ v ok) -∗
   recv_au γ.(mpmc_chan_name) V Φ.
 Proof.
   clear IntoValTyped0.
-  iIntros "#Hmpmc (Hlc1 & Hlc2) Hcons Hcont".
-  unfold is_mpmc.
-  iDestruct "Hmpmc" as "[Hchan Hinv]".
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  iDestruct (server_agree with "HrecvI Hcons") as %[Hn_pos Hsub].
-  unfold recv_au.
-  iExists s. iFrame "Hch".
-  iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask"].
-  iNext. iFrame.
-  destruct s; try done.
-  {
-    destruct buff as [|v rest].
-    { done. }
-    {
-      iIntros "Hoc".
-      unfold mpmc_consumer.
-      iMod (update_client γ.(mpmc_recv_name) n_cons recv received (recv ⊎ {[+ v +]})
-                                (received ⊎ {[+ v +]})
-             with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
-      { apply gmultiset_disj_union_local_update. }
-      iDestruct (big_sepL_cons with "Hinv_open") as "[HPv Hrest]".
-      iMod "Hmask".
-      iMod ("Hinv_close" with "[Hoc HsentI HrecvI_new Hrest Hclosed]") as "_".
-      {
-        iNext.
-        iFrame.
-        iFrame "%".
-        iFrame.
-        iPureIntro.
-        rewrite Hrel. simpl. unfold inflight_mset.
-        rewrite -gmultiset_disj_union_assoc.
-        reflexivity.
-      }
-      iModIntro. iApply "Hcont". iFrame.
-    }
-  }
-  {
-    iIntros "Hoc".
-    iMod "Hmask".
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hclosed]") as "_".
-    {
-      iNext.
-      iFrame. iFrame "%". iFrame.
-    }
-    iModIntro. unfold recv_nested_au.
-    iInv "Hinv" as "Hinv_open2" "Hinv_close2".
-    iMod (lc_fupd_elim_later with "Hlc2 Hinv_open2") as "Hinv_open2".
-    iNamed "Hinv_open2".
-    iDestruct (server_agree with "HrecvI Hcons") as %[_ Hsub2].
-    unfold recv_au.
-    iExists s. iFrame "Hch".
-    iApply fupd_mask_intro; [solve_ndisj|iIntros "Hmask1"].
-    iNext.
-    destruct s; try done.
-    {
-      iMod (update_client γ.(mpmc_recv_name) n_cons recv0 received (recv0 ⊎ {[+ v +]})
-                                (received ⊎ {[+ v +]})
-             with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
-      { apply gmultiset_disj_union_local_update. }
-      iIntros "Hoc".
-      iMod "Hmask1".
-      iMod ("Hinv_close2" with "[HsentI HrecvI_new Hoc Hclosed]") as "_".
-      {
-        iNext.
-        iFrame. iFrame "Hclosed". iPureIntro.
-        rewrite Hrel0. simpl. rewrite gmultiset_disj_union_right_id. done.
-      }
-      iModIntro. iApply "Hcont". iFrame.
-    }
-    {
-      destruct drain as [|v rest]; last done.
-      iIntros "Hoc".
-      iMod "Hmask1".
-      simpl.
-      iDestruct "Hinv_open2" as "[%Hprod2 HR]".
-      iNamed "HR".
-      iDestruct "HR_or_clients" as "[HR_final | Hconss]".
-      - iDestruct "Hclosed" as "#Hclosed".
-        iMod ("Hinv_close2" with "[Hoc HsentI HrecvI Hprods HR_final]") as "_".
-        {
-          iNext. iExists (chanstate.Closed []), sent0, recv0.
-          iFrame "#". iFrame. iFrame "%".
-        }
-        iModIntro.
-        iApply "Hcont".
-        iFrame "Hcons".
-        unfold is_closed.
-        iFrame.
-        iFrame "Hclosed".
-        done.
-      - unfold mpmc_consumer.
-        iNamed "Hconss".
-        iDestruct "Hconss" as "[%H1 Hcons1]".
-        subst n_cons.
-        iMod (bulk_dealloc_all with "HrecvI Hcons1") as "[Hserver0 _]".
-        iFrame.
-        destruct conss as [|p ps]; first (simpl in *;lia).
-        iDestruct (server_agree with "Hserver0 Hcons") as %[Hcontra _].
-        done.
-    }
-  }
-  {
-    iIntros "Hcont1".
-    iMod "Hmask".
-    iMod (update_client γ.(mpmc_recv_name) n_cons recv received (recv ⊎ {[+ v +]})
-                                (received ⊎ {[+ v +]})
-             with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
+  iIntros "#Hmpmc Hcons Hcont".
+  unfold is_mpmc. iDestruct "Hmpmc" as "[Hchan Hinv]".
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au : SndWait w -> RcvDone *)
+    iIntros (w) "[Hlc Himpl]". mp_openc. mp_step (@chanstate.RcvDone V) Hcv1.
+    iNamed "Hi".
+    iMod (update_client γ.(mpmc_recv_name) n_cons recv received
+                       (recv ⊎ {[+ w +]}) (received ⊎ {[+ w +]})
+           with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
     { apply gmultiset_disj_union_local_update. }
-    iMod ("Hinv_close" with "[HsentI HrecvI_new Hcont1 Hclosed]") as "_".
-    {
-      iNext.
-      iFrame. iFrame "Hclosed". iPureIntro.
-      unfold inflight_mset in *. rewrite gmultiset_disj_union_right_id. done.
-    }
-    iModIntro. iApply "Hcont". iFrame.
-  }
-  {
-    destruct drain as [|v rest].
-    {
-      iIntros "Hoc".
-      iMod "Hmask".
-      simpl.
-      iDestruct "Hinv_open" as "[%Hprod2 HR]".
-      iNamed "HR".
-      iDestruct "HR_or_clients" as "[HR_final | Hconss]".
-      - iDestruct "Hclosed" as "#Hclosed".
-        iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hprods HR_final]") as "_".
-        {
-          iNext.
-          iFrame.
-          iFrame "#". iFrame. iFrame "%".
-        }
-        iModIntro.
-        iApply "Hcont".
-        iFrame "Hcons".
-        unfold is_closed.
-        iFrame.
-        iFrame "Hclosed".
-        done.
-      - unfold mpmc_consumer.
-        iNamed "Hconss".
-        iDestruct "Hconss" as "[%H1 Hcons1]".
-        subst n_cons.
-        iMod (bulk_dealloc_all with "HrecvI Hcons1") as "[Hserver0 _]".
-        iFrame.
-        destruct conss as [|p ps]; first (simpl in *;lia).
-        iDestruct (server_agree with "Hserver0 Hcons") as %[Hcontra _].
-        done.
-    }
-    {
-      iIntros "Hoc".
-      iMod (update_client _ _ recv received (recv ⊎ {[+ v +]}) (received ⊎ {[+ v +]})
-             with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
-      { apply gmultiset_disj_union_local_update. }
-      iMod "Hmask".
-      iDestruct "Hinv_open" as "(Hrest & Hmp & HR)".
-      {
-        iDestruct (big_sepL_cons with "Hrest") as "[HPv Hrest2]".
-        destruct rest.
-        {
-          iMod (dghost_var_update true with "Hclosed") as "Hclosed".
-          iMod (dghost_var_persist with "Hclosed") as "#Hclosed'".
-          iMod ("Hinv_close" with "[HsentI HrecvI_new Hoc HR Hmp]") as "_".
-          {
-            iNext.
-            iFrame. iFrame "#". iFrame "HR".
-            iFrame "Hmp". iPureIntro.
-            split.
-            {
-              rewrite Hrel. unfold inflight_mset.
-              rewrite list_to_set_disj_cons list_to_set_disj_nil.
-              rewrite gmultiset_disj_union_right_id -gmultiset_disj_union_assoc.
-              set_solver.
-            }
-            set_solver.
-          }
-          iModIntro. iApply "Hcont". iFrame.
-        }
-        {
-          iMod ("Hinv_close" with "[HsentI HrecvI_new Hoc Hrest2 HR Hmp Hclosed]") as "_".
-          {
-            iNext.
-            iFrame. iFrame "HR".
-            iFrame.
-            iFrame "%".
-            iFrame "#".
-            iPureIntro.
-            rewrite Hrel. unfold inflight_mset.
-            rewrite !list_to_set_disj_cons -!gmultiset_disj_union_assoc.
-            reflexivity.
-          }
-          iModIntro. iApply "Hcont". iFrame.
-        }
-      }
-    }
-  }
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new Hclosed]") as "_".
+    { iNext. iExists chanstate.RcvDone, sent, (recv ⊎ {[+ w +]}).
+      iFrame "H1 HsentI HrecvI_new Hclosed".
+      iPureIntro. split_and!; try done.
+      simpl in Hrel |- *. multiset_solver. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "HPv Hcons_new".
+  - (* recv_slow_path_au : Idle -> RcvWait, then SndDone w -> Idle *)
+    iIntros "[Hlc Himpl]". mp_openc. mp_step (@chanstate.RcvWait V) Hcv2.
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed]") as "_".
+    { iNext. iExists chanstate.RcvWait, sent, recv.
+      iFrame "H1 HsentI HrecvI Hclosed". iPureIntro. split_and!; try done. }
+    iModIntro. iFrame "H2". try iClear "Hi".
+    (* phase two, fired once the sender has committed *)
+    iIntros (w) "[Hlc Himpl]". mp_open. mp_step (@chanstate.Idle V) Hcv3.
+    iNamed "Hi".
+    iMod (update_client γ.(mpmc_recv_name) n_cons recv0 received
+                       (recv0 ⊎ {[+ w +]}) (received ⊎ {[+ w +]})
+           with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
+    { apply gmultiset_disj_union_local_update. }
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new Hclosed]") as "_".
+    { iNext. iExists chanstate.Idle, sent0, (recv0 ⊎ {[+ w +]}).
+      iFrame "H1 HsentI HrecvI_new Hclosed".
+      iPureIntro. split_and!; try done.
+      simpl in Hrel0 |- *. multiset_solver. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "HPv Hcons_new".
+  - (* recv_deq_au : take the head off the buffer *)
+    iIntros (w rest) "[Hlc Himpl]". mp_openc. mp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Buffered rest) with "Hch Himpl") as "[H1 H2]".
+    { simpl in Hlen |- *. split; lia. } iNamed "Hi".
+    iDestruct "Hbuff" as "[HPv Hrest]".
+    iMod (update_client γ.(mpmc_recv_name) n_cons recv received
+                       (recv ⊎ {[+ w +]}) (received ⊎ {[+ w +]})
+           with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
+    { apply gmultiset_disj_union_local_update. }
+    iMod ("Hclose" with "[H1 HsentI HrecvI_new Hclosed Hrest]") as "_".
+    { iNext. iExists (chanstate.Buffered rest), sent, (recv ⊎ {[+ w +]}).
+      iFrame "H1 HsentI HrecvI_new Hclosed Hrest".
+      iPureIntro. split_and!; try done.
+      rewrite Hrel. simpl. multiset_solver. }
+    iModIntro. iFrame "H2". iApply "Hcont". iFrame "HPv Hcons_new".
+  - (* recv_drain_au : take the head off a closed channel's drain *)
+    iIntros (w rest) "[Hlc Himpl]". mp_openc. mp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iNamed "Hi". iDestruct "Hdrain" as "[HPv Hrest]".
+    iMod (update_client γ.(mpmc_recv_name) n_cons recv received
+                       (recv ⊎ {[+ w +]}) (received ⊎ {[+ w +]})
+           with "HrecvI Hcons") as "[HrecvI_new Hcons_new]".
+    { apply gmultiset_disj_union_local_update. }
+    destruct rest as [|r rs].
+    + (* last drained value: the channel becomes fully closed *)
+      iMod (own_chan_halves_update (@chanstate.Closed V []) with "Hch Himpl") as "[H1 H2]".
+      { simpl in Hlen |- *. lia. }
+      iMod (dghost_var_update true with "Hclosed") as "Hclosed".
+      iMod (dghost_var_persist with "Hclosed") as "#Hclosed'".
+      iMod ("Hclose" with "[H1 HsentI HrecvI_new Hprods HR]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent, (recv ⊎ {[+ w +]}).
+        iFrame "H1 HsentI HrecvI_new". iFrame "#". iFrame "Hprods".
+        (* Hrel, n_cons, n_prod, Hsent_recv, then the [R sent] disjunct *)
+        iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+        iLeft. iFrame "HR". }
+      iModIntro. iFrame "H2". iApply "Hcont". iFrame "HPv Hcons_new".
+    + (* more values still to drain *)
+      iMod (own_chan_halves_update (chanstate.Closed (r :: rs)) with "Hch Himpl")
+        as "[H1 H2]".
+      { simpl in Hlen |- *. split; lia. }
+      iMod ("Hclose" with "[H1 HsentI HrecvI_new Hclosed Hrest Hprods HR]") as "_".
+      { iNext. iExists (chanstate.Closed (r :: rs)), sent, (recv ⊎ {[+ w +]}).
+        iFrame "H1 HsentI HrecvI_new Hclosed Hrest Hprods HR".
+        iPureIntro. split_and!; try done.
+        rewrite Hrel. simpl. multiset_solver. }
+      iModIntro. iFrame "H2". iApply "Hcont". iFrame "HPv Hcons_new".
+  - (* recv_closed_au : drained and closed, so the receive fails *)
+    iIntros "[Hlc Himpl]". mp_openc. mp_agree.
+    iNamed "Hi".
+    iDestruct "HR_or_clients" as "[HR_final | Hconss]".
+    + iDestruct "Hclosed" as "#Hclosed".
+      iMod ("Hclose" with "[Hch HsentI HrecvI Hprods HR_final]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent, recv.
+        iFrame "Hch HsentI HrecvI Hprods". iFrame "#".
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iLeft. iFrame "HR_final". }
+      iModIntro. iFrame "Himpl". iApply "Hcont".
+      iFrame "Hcons". unfold is_drained. iFrame "#". done.
+    + (* the invariant already holds every consumer client, so ours is one too many *)
+      unfold mpmc_consumer. iNamed "Hconss".
+      iDestruct "Hconss" as "[%Hlen2 Hcons1]". subst n_cons.
+      iMod (bulk_dealloc_all with "HrecvI Hcons1") as "[Hserver0 _]".
+      destruct conss as [|p ps]; first (simpl in Hncons; lia).
+      iDestruct (server_agree γ.(mpmc_recv_name) 0 (∅ : gmultiset V) received
+                  with "Hserver0 Hcons") as %[Hcontra _].
+      exfalso; exact (Hcontra eq_refl).
 Qed.
 
 Lemma wp_mpmc_receive γ ch (n_prod n_cons:nat) (P : V → iProp Σ) (R : gmultiset V → iProp Σ)
@@ -787,163 +617,110 @@ Lemma wp_mpmc_receive γ ch (n_prod n_cons:nat) (P : V → iProp Σ) (R : gmulti
   {{{ (v:V) (ok:bool), RET (#v, #ok);
       if ok
       then P v ∗ mpmc_consumer γ (received ⊎ {[+ v +]})
-      else is_closed γ ∗ mpmc_consumer γ received ∗ ⌜ v = (zero_val V) ⌝ }}}.
+      else is_drained γ ∗ mpmc_consumer γ received ∗ ⌜ v = (zero_val V) ⌝ }}}.
 Proof using W.
   iIntros (Φ) "( #Hmpmc & Hcons) Hcont".
   unfold is_mpmc.
   iPoseProof "Hmpmc" as "[#Hchan _]".
   iApply (chan.wp_receive ch γ.(mpmc_chan_name) with "[$Hchan]").
-  iIntros "(Hlc1 & Hlc2 & Hlc3 & Hlc4)".
-  iApply (mpmc_rcv_au with "[$Hmpmc] [$] [$Hcons]").
+  iIntros "_".
+  iApply (mpmc_rcv_au with "[$Hmpmc] [$Hcons]").
   done.
 Qed.
 
+(* Close only has to consider Idle and Buffered: [tryClose] spins on every
+   pending/committed state, so those are unreachable here. *)
 Lemma mpmc_close_au γ ch (n_prod n_cons:nat) P R (producers : list (gmultiset V)) Φ :
   length producers = n_prod →
   is_mpmc γ ch n_prod n_cons P R -∗
-  £ 1 -∗
   ([∗ list] s_i ∈ producers, mpmc_producer γ s_i) ∗
         R (foldr (⊎) ∅ producers) -∗
   ▷ Φ -∗
   close_au γ.(mpmc_chan_name) V Φ.
 Proof.
   clear IntoValTyped0.
-  intros.
-  iIntros "#Hmpmc Hlc1 (Hprods & HR) Hcont".
-  unfold is_mpmc.
-  iDestruct "Hmpmc" as "[Hchan Hinv]".
-  iInv "Hinv" as "Hinv_open" "Hinv_close".
-  iMod (lc_fupd_elim_later with "Hlc1 Hinv_open") as "Hinv_open".
-  iNamed "Hinv_open".
-  destruct s; try done.
-  - iExists (chanstate.Buffered buff). iFrame "Hch".
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iIntros "Hoc".
-    iMod "Hmask".
-    iFrame.
-    destruct buff as [|v rest].
-    + iMod (dghost_var_update true with "Hclosed") as "Hclosed".
-      iMod (dghost_var_persist with "Hclosed") as "#Hclosed'".
-      assert (inflight_mset (chanstate.Buffered []) = ∅) as Hempty.
-      { simpl. reflexivity. }
-      rewrite Hempty in Hrel.
-      symmetry in Hrel.
-      rewrite (right_id (R:=eq)) in Hrel.
-      unfold mpmc_producer.
-      subst n_prod.
-      iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-      replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-      iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hinv_open Hprods HR]") as "_".
-      {
-        iNext.
-        iFrame. iFrame "#".
-        simpl.
-        iFrame "%".
-        rewrite (right_id (R:=eq)).
-        iSplitL ""; first done.
-        unfold inflight_mset in Hrel.
-        simpl in Hrel.
-        iFrame.
-        done.
-      }
-      iModIntro.
-      done.
-    + iFrame.
-      unfold mpmc_producer.
-      subst n_prod.
-      iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-      replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-      iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hinv_open Hprods Hclosed HR]") as "_".
-      {
-        iModIntro. iFrame.
-        iFrame "%#". iFrame.
-        done.
-      }
-      iModIntro.
-      done.
-  - iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iFrame. iIntros "Hoc".
+  intros Hnp.
+  iIntros "#Hmpmc (Hprods1 & HR) Hcont".
+  unfold is_mpmc. iDestruct "Hmpmc" as "[Hchan Hinv]".
+  rewrite /close_au. repeat iSplit.
+  - (* close_idle_au : Idle -> Closed [] *)
+    iIntros "[Hlc Himpl]". mp_openc. mp_step (@chanstate.Closed V []) Hcv1.
     iMod (dghost_var_update true with "Hclosed") as "Hclosed".
     iMod (dghost_var_persist with "Hclosed") as "#Hclosed'".
-    iMod "Hmask".
+    unfold mpmc_producer. subst n_prod.
+    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods1]")
+      as "(%Hsent_eq & HsentI & Hprods1)".
+    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
+    iMod ("Hclose" with "[H1 HsentI HrecvI Hprods1 HR]") as "_".
+    { iNext. iExists (chanstate.Closed []), sent, recv.
+      iFrame "H1 HsentI HrecvI". iFrame "#".
+      iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+      iSplitR; [ iPureIntro; done | ].
+      iSplitR; [ iPureIntro; done | ].
+      iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+      iFrame "Hprods1". iSplitR; [ iPureIntro; done | ]. iLeft. iFrame "HR". }
+    iModIntro. iFrame "H2 Hcont".
+  - (* close_buf_au : the buffered values become the drain *)
+    iIntros (buf) "[Hlc Himpl]". mp_openc. mp_agree.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    unfold mpmc_producer. subst n_prod.
+    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods1]")
+      as "(%Hsent_eq & HsentI & Hprods1)".
+    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
+    destruct buf as [|d ds].
+    + (* nothing buffered, so the channel is closed and already drained *)
+      iMod (own_chan_halves_update (@chanstate.Closed V []) with "Hch Himpl") as "[H1 H2]".
+      { simpl in Hlen |- *. lia. }
+      iMod (dghost_var_update true with "Hclosed") as "Hclosed".
+      iMod (dghost_var_persist with "Hclosed") as "#Hclosed'".
+      iMod ("Hclose" with "[H1 HsentI HrecvI Hprods1 HR]") as "_".
+      { iNext. iExists (chanstate.Closed []), sent, recv.
+        iFrame "H1 HsentI HrecvI". iFrame "#".
+        iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+        iFrame "Hprods1". iSplitR; [ iPureIntro; done | ]. iLeft. iFrame "HR". }
+      iModIntro. iFrame "H2 Hcont".
+    + iMod (own_chan_halves_update (chanstate.Closed (d :: ds)) with "Hch Himpl")
+        as "[H1 H2]".
+      { simpl in Hlen |- *. split; lia. } iNamed "Hi".
+      iMod ("Hclose" with "[H1 HsentI HrecvI Hclosed Hbuff Hprods1 HR]") as "_".
+      { iNext. iExists (chanstate.Closed (d :: ds)), sent, recv.
+        iFrame "H1 HsentI HrecvI Hclosed".
+        iSplitR; [ iPureIntro; simpl in Hrel |- *; multiset_solver | ].
+        iSplitR; [ iPureIntro; done | ].
+        iSplitR; [ iPureIntro; done | ].
+        iFrame "Hbuff HR Hprods1". try (iPureIntro; done). }
+      iModIntro. iFrame "H2 Hcont".
+  - (* close_closed_au : the invariant already holds every producer client, so the
+       [mpmc_producer]s we were handed are too many.  [server_agree] and
+       [auth_map_agree] both need their carrier given explicitly. *)
+    iIntros (drain) "[Hlc Himpl]". mp_openc. mp_agree.
     unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    iMod ("Hinv_close" with "[Hoc HsentI HrecvI Hclosed' Hprods HR]") as "_".
-    {
-      iNext.
-      iExists (chanstate.Closed []), sent, recv.
-      iFrame "Hoc HsentI HrecvI".
-      iSplitR; first by iPureIntro; rewrite Hrel; simpl.
-      iFrame "Hclosed'".
-      simpl. iFrame.
-      iPureIntro.
-      unfold inflight_mset in Hrel.
-      simpl in Hrel.
-      subst sent.
-      multiset_solver.
-    }
-    iModIntro. done.
-  - unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iFrame.
-  - unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iFrame.
-  - unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iFrame.
-  - unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hmask". iNext.
-    iFrame.
-  - unfold mpmc_producer.
-    subst n_prod.
-    iMod (auth_map_agree γ.(mpmc_sent_name) sent producers with "[$HsentI] [$Hprods]") as "(%Hsent_eq & HsentI & Hprods)".
-    replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
-    destruct drain.
-    {
-      iDestruct "Hprods" as "Hprods1".
-      iNamed "Hinv_open". iNamed "Hprods".
-      iDestruct "Hprods" as "[%Hgood H2]".
-      replace (length producers) with (length prods) by done.
-      iMod (auth_map_agree γ.(mpmc_sent_name) sent prods with "[$HsentI] [$H2]") as
-        "(%Hsent_eq1 & HsentI2 & Hprods2)".
-      replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
+    destruct drain as [|d ds].
+    + iNamed "Hi". iDestruct "Hprods" as (prods) "[%Hgood H2]".
+      replace n_prod with (length prods) by lia.
+      iMod (auth_map_agree γ.(mpmc_sent_name) sent prods with "[$HsentI] [$H2]")
+        as "(%Hsent_eq1 & HsentI2 & Hprods2)".
       iMod (bulk_dealloc_all with "HsentI2 Hprods2") as "[Hserver0 _]".
-      destruct producers as [|p ps]; first (simpl in *;lia).
-      iDestruct (big_sepL_cons with "Hprods1") as "[Hp _]".
-      iExFalso.
-      iDestruct (server_agree with "Hserver0 Hp") as %[Hcontra _].
+      destruct producers as [|p ps]; first (simpl in Hnp; lia).
+      iDestruct "Hprods1" as "[Hp _]".
+      iDestruct (server_agree γ.(mpmc_sent_name) 0 (∅ : gmultiset V) p
+                  with "Hserver0 Hp") as %[Hcontra _].
       lia.
-    }
-    {
-      iDestruct "Hprods" as "Hprods1". iDestruct "HR" as "HR1".
-      iNamed "Hinv_open". iNamed "Hprods".
-      iDestruct "Hprods" as "[%Hgood H2]".
-      replace (length producers) with (length prods) by done.
-      iMod (auth_map_agree γ.(mpmc_sent_name) sent prods with "[$HsentI] [$H2]") as
-        "(%Hsent_eq1 & HsentI2 & Hprods2)".
-      replace (foldr (λ acc y : gmultiset V, acc ⊎ y) ∅ producers) with sent by done.
+    + (* [iNamed] stops after [Hdrain] here, leaving the rest parked under [Hi] *)
+      iNamed "Hi". iDestruct "Hi" as "(Hprods & HR2)".
+      iDestruct "Hprods" as (prods) "[%Hgood H2]".
+      replace n_prod with (length prods) by lia.
+      iMod (auth_map_agree γ.(mpmc_sent_name) sent prods with "[$HsentI] [$H2]")
+        as "(%Hsent_eq1 & HsentI2 & Hprods2)".
       iMod (bulk_dealloc_all with "HsentI2 Hprods2") as "[Hserver0 _]".
-      destruct producers as [|p ps]; first (simpl in *;lia).
-      iDestruct (big_sepL_cons with "Hprods1") as "[Hp _]".
-      iExFalso.
-      iDestruct (server_agree with "Hserver0 Hp") as %[Hcontra _].
+      destruct producers as [|p ps]; first (simpl in Hnp; lia).
+      iDestruct "Hprods1" as "[Hp _]".
+      iDestruct (server_agree γ.(mpmc_sent_name) 0 (∅ : gmultiset V) p
+                  with "Hserver0 Hp") as %[Hcontra _].
       lia.
-    }
 Qed.
 
 Lemma wp_mpmc_close γ ch (n_prod n_cons:nat) P R (producers : list (gmultiset V)) `[ct ↓u go.ChannelType dir t]:
@@ -958,8 +735,8 @@ Proof using W.
   iIntros "(#Hmpmc & Hprods & HR) Hcont".
   iPoseProof "Hmpmc" as "[#Hchan _]".
   iApply (chan.wp_close with "Hchan").
-  iIntros "(Hlc1 & _ & _ & _)".
-  iApply (mpmc_close_au with "[$Hmpmc] [$] [$Hprods $HR]").
+  iIntros "_".
+  iApply (mpmc_close_au with "[$Hmpmc] [$Hprods $HR]").
   { done. }
   iModIntro. by iApply "Hcont".
 Qed.
@@ -969,7 +746,7 @@ Lemma mpmc_get_final_resource
   length consumers = n_cons →
   £ 1 -∗
   is_mpmc γ ch n_prod n_cons P R -∗
-  is_closed γ -∗
+  is_drained γ -∗
   ([∗ list] r_i ∈ consumers, mpmc_consumer γ r_i)
   ={⊤}=∗ R (foldr disj_union ∅ consumers).
 Proof.
@@ -981,7 +758,7 @@ Proof.
   iMod (lc_fupd_elim_later with "Hlc Hinv_open") as "Hinv_open".
   iDestruct "Hclosed" as "#Hclosed1".
   iNamed "Hinv_open".
-  unfold is_closed.
+  unfold is_drained.
   destruct s; try (iExFalso;(iDestruct (dghost_var_agree with "Hclosed1 Hclosed") as %Hbad);done).
   destruct drain.
   - iNamed "Hinv_open".

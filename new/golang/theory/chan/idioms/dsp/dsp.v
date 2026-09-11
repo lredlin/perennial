@@ -59,7 +59,7 @@ Definition buffer_matches {V}
     (state : chanstate.t V) (vs : list V) : Prop :=
   match state with
   | chanstate.Buffered queue => vs = queue
-  | chanstate.SndPending v | chanstate.SndCommit v => vs = [v]
+  | chanstate.SndWait v | chanstate.SndDone v => vs = [v]
   | chanstate.Closed drain => vs = drain
   | _ => vs = []
   end.
@@ -170,57 +170,88 @@ Qed.
 
 
 (** Endpoint sends value *)
+(* Open the dsp session invariant.  It owns both channels, so each arm agrees
+   against the half for its own direction. *)
+Local Ltac dsp_open :=
+  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|];
+  iMod (lc_fupd_elim_later with "Hlc IH") as "IH";
+  iDestruct "IH" as (????)
+    "(%Hbml & %Hbmr & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+(* One credit strips the session invariant and the client's continuation
+   together.  Phase two of a two-phase arm uses [dsp_open]. *)
+Local Ltac dsp_openc :=
+  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|];
+  iCombine "IH HΦ" as "IHc";
+  iMod (lc_fupd_elim_later with "Hlc IHc") as "[IH HΦ]";
+  iDestruct "IH" as (????)
+    "(%Hbml & %Hbmr & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+
 Lemma dsp_send_au γ (lr_chan rl_chan : loc) (v : V) (p : iProto Σ V) Φ :
-  £1 -∗
   (lr_chan,rl_chan) ↣{γ} (<!> MSG v; p)%proto -∗
   ▷((lr_chan,rl_chan) ↣{γ} p -∗ Φ) -∗
-  send_au γ.(chan_lr_name) v Φ.
+  send_au γ.(chan_lr_name) V v Φ.
 Proof.
-  iIntros "H£ Hc HΦ".
+  iIntros "Hc HΦ".
   iDestruct "Hc" as "(#(Hcl&Hcr&HI)&Hp)".
-  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-  iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-  iApply fupd_mask_intro; [solve_ndisj|].
-  iIntros "Hclose'".
-  iModIntro.
-  iExists _. iFrame.
-  destruct lr_state.
-  - iIntros "Hownl".
+  rewrite /send_au. repeat iSplit.
+  - (* send_fast_path_au : RcvWait -> SndDone v *)
+    iIntros "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcv.
+    iMod (own_chan_halves_update (chanstate.SndDone v) with "Hownl Himpl")
+      as "[H1 H2]"; [ simpl in Hcv |- *; lia | ].
     iDestruct (iProto_send _ _ _ _ _ v p with "Hctx Hp []") as "Hp".
     { by rewrite iMsg_base_eq. }
-    iMod "Hp" as "[Hp Hown]". iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hp]").
-    { iIntros "!>". iExists _,_,_,_. iFrame. inversion H. iFrame. done. }
-    iApply "HΦ". by iFrame "#∗".
-  - iIntros "Hownl".
+    iMod "Hp" as "[Hctx2 Hown]".
+    iMod ("Hclose" with "[H1 Hownr Hclosel Hcloser Hctx2]").
+    { iIntros "!>". iExists _,_,_,_. iFrame. try (simpl in Hbml; subst).
+      iFrame "Hclosel". iPureIntro. split_and!; done. }
+    iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
+  - (* send_slow_path_au : Idle -> SndWait v, then RcvDone -> Idle *)
+    iIntros "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcv.
+    iMod (own_chan_halves_update (chanstate.SndWait v) with "Hownl Himpl")
+      as "[H1 H2]"; [ simpl in Hcv |- *; lia | ].
     iDestruct (iProto_send _ _ _ _ _ v p with "Hctx Hp []") as "Hp".
     { by rewrite iMsg_base_eq. }
-    iMod "Hp" as "[Hctx Hown]". iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]").
-    { iIntros "!>". iExists _,_,_,_. iFrame. inversion H. iFrame. done. }
-    iModIntro.
+    iMod "Hp" as "[Hctx2 Hown]".
+    iMod ("Hclose" with "[H1 Hownr Hclosel Hcloser Hctx2]").
+    { iIntros "!>". iExists _,_,_,_. iFrame. try (simpl in Hbml; subst).
+      iFrame "Hclosel". iPureIntro. split_and!; done. }
+    iModIntro. iFrame "H2".
+    (* phase two, fired once the receiver has committed *)
+    iIntros "[Hlc Himpl]".
     iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hclose'".
-    iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-    iFrame.
-    iIntros "!>".
-    destruct lr_state; try done.
-    + iIntros "Hownl". iMod "Hclose'".
-      iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]").
-      { iIntros "!>". iExists _,_,_,_. iFrame. iFrame. done. }
-      iApply "HΦ". iFrame "#∗". done.
-    + iDestruct (iProto_own_excl with "Hown Hclosel") as "[]".
-  - done.
-  - iIntros "Hownl".
+    iMod (lc_fupd_elim_later with "Hlc IH") as "IH".
+    iDestruct "IH" as (????)
+      "(%Hbml2 & %Hbmr2 & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcv2.
+    iMod (own_chan_halves_update (@chanstate.Idle V) with "Hownl Himpl")
+      as "[H1 H2]"; [ simpl in Hcv2 |- *; lia | ].
+    iMod ("Hclose" with "[H1 Hownr Hclosel Hcloser Hctx]").
+    { iIntros "!>". iExists _,_,_,_. iFrame. try (simpl in Hbml2; subst).
+      iFrame "Hclosel". iPureIntro. split_and!; done. }
+    iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
+  - (* send_enq_au : append to the buffer *)
+    iIntros (buf) "(Hlc & %Hlt & Himpl)". dsp_openc.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Buffered (buf ++ [v])) with "Hownl Himpl")
+      as "[H1 H2]"; [ simpl; rewrite length_app /=; lia | ].
     iDestruct (iProto_send _ _ _ _ _ v p with "Hctx Hp []") as "Hp".
     { by rewrite iMsg_base_eq. }
-    iMod "Hp" as "[Hp Hown]". iMod "Hclose'".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hp]").
-    { iIntros "!>". iExists _,_,_,_. iFrame. inversion H. iFrame. done. }
-    iApply "HΦ". by iFrame "#∗".
-  - done.
-  - done.
-  - iDestruct (iProto_own_excl with "Hp Hclosel") as "[]".
+    iMod "Hp" as "[Hctx2 Hown]".
+    iMod ("Hclose" with "[H1 Hownr Hclosel Hcloser Hctx2]").
+    { iIntros "!>". iExists _,_,_,_. iFrame. try (simpl in Hbml; subst).
+      iFrame "Hclosel". iPureIntro. split_and!; done. }
+    iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
+  - (* send_closed_au : the session invariant holds [iProto_own END], which is
+       exclusive with the endpoint's own protocol ownership *)
+    iIntros (drain) "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (iProto_own_excl with "Hp Hclosel") as "[]".
 Qed.
 
 Lemma wp_dsp_send (lr_chan rl_chan : loc) γ (v : V) (p : iProto Σ V) :
@@ -231,8 +262,8 @@ Proof using W.
   iIntros (Φ) "Hc HΦ".
   iDestruct "Hc" as "(#(Hcl&Hcr&HI)&Hp)".
   iApply (chan.wp_send with "Hcl").
-  iIntros "(Hlc1 & Hlc2 & _)".
-  iApply (dsp_send_au with "[$] [$Hp]").
+  iIntros "_".
+  iApply (dsp_send_au with "[$Hp]").
   { iFrame "#". }
   done.
 Qed.
@@ -240,20 +271,19 @@ Qed.
 Lemma dsp_send_tele_au
   {TT : tele} (tt:TT)
   γ (lr_chan rl_chan : loc) (v : TT → V) (P : TT → iProp Σ) (p : TT → iProto Σ V) Φ :
-  £1 -∗
   (lr_chan,rl_chan) ↣{γ} ((<!.. x> MSG (v x) {{ P x }}; p x))%proto -∗
   P tt -∗
   ((lr_chan,rl_chan) ↣{γ} p tt -∗ Φ) -∗
-  send_au γ.(chan_lr_name) (v tt) Φ.
+  send_au γ.(chan_lr_name) V (v tt) Φ.
 Proof.
-  iIntros "H£ Hc HP HΦ".
+  iIntros "Hc HP HΦ".
   iDestruct (iProto_pointsto_le _ _ _ (<!> MSG v tt; p tt)%proto with "Hc [HP]")
     as "Hc".
   { iIntros "!>".
     iApply iProto_le_trans;
       [iApply iProto_le_texist_intro_l|].
     by iFrame "HP". }
-  iApply (dsp_send_au with "H£ Hc HΦ").
+  iApply (dsp_send_au with "Hc HΦ").
 Qed.
 
 Lemma wp_dsp_send_tele
@@ -274,6 +304,27 @@ Proof using W.
 Qed.
 
 (** Endpoint receives value *)
+(* Common tail once the arm has moved the channel to its post-state in [H1]/[H2]:
+   take the protocol step and hand the message to the continuation.  The later
+   credits are for the protocol's own laters, not for the invariant. *)
+Local Ltac dsp_recv_finish :=
+  iDestruct (iProto_recv with "Hctx Hp") as "Hp";
+  iMod "Hp" as (xs) "(Hctx2 & Hown & Hm)";
+  iMod ("Hclose" with "[Hownl H1 Hclosel Hcloser Hctx2]") as "_";
+  [ iIntros "!>"; iExists _,_,_,_; iFrame "H1 ∗"; iSplit; [done|];
+    iPureIntro; simpl in *; by simplify_eq | ];
+  iDestruct "H£s" as "[H£ H£s]";
+  iCombine "Hown Hm" as "H";
+  iMod (lc_fupd_elim_later with "H£ H") as "[Hown Hm]";
+  rewrite iMsg_base_eq;
+  iDestruct (iMsg_texist_exist with "Hm") as (x <-) "[Hp HP]";
+  simpl in *; simplify_eq;
+  iDestruct "H£s" as "[H£ H£s]";
+  rewrite later_equivI_1;
+  iCombine "HP Hp" as "H";
+  iMod (lc_fupd_elim_later with "H£ H") as "[HP Hp]";
+  iModIntro; iFrame "H2"; iApply "HΦ"; iRewrite "Hp"; by iFrame "#∗".
+
 Lemma dsp_recv_au {TT:tele}
     γ (lr_chan rl_chan : loc) (v : TT → V) (P : TT → iProp Σ) (p : TT → iProto Σ V) Φ :
   (£1 ∗ £1) -∗
@@ -283,113 +334,57 @@ Lemma dsp_recv_au {TT:tele}
 Proof.
   iIntros "H£s Hc HΦ".
   iDestruct "Hc" as "(#(Hcl&Hcr&HI)&Hp)".
-  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-  iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-  iApply fupd_mask_intro; [solve_ndisj|].
-  iIntros "Hclose'".
-  iModIntro.
-  iExists _. iFrame.
-  destruct rl_state.
-  - destruct buff; [done|].
-    destruct vsr; [done|].
-    iIntros "Hownr".
-    iDestruct (iProto_recv with "Hctx Hp") as "Hp".
-    iMod "Hp" as (xs) "(Hctx & Hown & Hm)". iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au : SndWait w -> RcvDone *)
+    iIntros (w) "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (@chanstate.RcvDone V) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; lia | ].
+    simpl in *. simplify_eq. dsp_recv_finish.
+  - (* recv_slow_path_au : Idle -> RcvWait, then SndDone w -> Idle *)
+    iIntros "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (@chanstate.RcvWait V) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; lia | ].
+    iMod ("Hclose" with "[Hownl H1 Hclosel Hcloser Hctx]") as "_".
+    { iIntros "!>". iExists _,_,_,_. iFrame "H1 ∗". iSplit; [done|].
       iPureIntro. simpl in *. by simplify_eq. }
-    iDestruct "H£s" as "[H£ H£s]".
-    iCombine "Hown Hm" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[Hown Hm]".
-    rewrite iMsg_base_eq.
-    iDestruct (iMsg_texist_exist with "Hm") as (x <-) "[Hp HP]".
-    simpl in *. simplify_eq.
-    iApply "HΦ".
-    iDestruct "H£s" as "[H£ H£s]".
-    rewrite later_equivI_1.
-    iCombine "HP Hp" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[HP Hp]".
-    iModIntro. iRewrite "Hp". by iFrame "#∗".
-  - iIntros "Hownr".
-    iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame. iFrame. done. }
-    iModIntro.
+    iModIntro. iFrame "H2".
+    (* phase two, fired once the sender has committed *)
+    iIntros (w) "[Hlc Himpl]".
     iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-    iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-    iApply fupd_mask_intro; [solve_ndisj|]. iIntros "Hclose'". iModIntro.
-    iExists _. iFrame.
-    destruct rl_state; try done.
-    + iIntros "Hownr".
-      simpl in *. simplify_eq.
-      iDestruct (iProto_recv with "Hctx Hp") as "Hp".
-      iMod "Hp" as (xs) "(Hctx & Hown & Hm)". iMod "Hclose'" as "_".
-      iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-      { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
-        iPureIntro. simpl in *. by simplify_eq. }
-      iCombine "Hown Hm" as "H".
-      iDestruct "H£s" as "[H£ H£s]".
-      iMod (lc_fupd_elim_later with "H£ H") as "[Hown Hm]".
-      rewrite iMsg_base_eq.
-      iDestruct (iMsg_texist_exist with "Hm") as (x <-) "[Hp HP]".
-      simpl in *. simplify_eq.
-      iApply "HΦ".
-      iDestruct "H£s" as "[H£ H£s]".
-      rewrite later_equivI_1.
-      iCombine "HP Hp" as "H".
-      iMod (lc_fupd_elim_later with "H£ H") as "[HP Hp]".
-      iModIntro. iRewrite "Hp". by iFrame "#∗".
-    + simpl in *. simplify_eq.
-      destruct drain; [|done].
-      iDestruct (iProto_recv_end_inv_l with "Hctx Hp Hcloser") as "H".
-      iDestruct "H£s" as "[H£ H£s]".
-      iMod (lc_fupd_elim_later with "H£ H") as "[]".
-  - iIntros "Hownr".
+    iMod (lc_fupd_elim_later with "Hlc IH") as "IH".
+    iDestruct "IH" as (????)
+      "(%Hbml2 & %Hbmr2 & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap2.
+    iMod (own_chan_halves_update (@chanstate.Idle V) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap2 |- *; lia | ].
+    simpl in *. simplify_eq. dsp_recv_finish.
+  - (* recv_deq_au : take the head off the buffer *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (chanstate.Buffered rest) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; split; lia | ].
+    simpl in *. simplify_eq. dsp_recv_finish.
+  - (* recv_drain_au : take the head off a closed channel's drain *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (chanstate.Closed rest) with "Hownr Himpl")
+      as "[H1 H2]"; [ destruct rest; simpl in Hcap |- *; [ lia | split; lia ] | ].
+    simpl in *. simplify_eq. dsp_recv_finish.
+  - (* recv_closed_au : a drained, closed channel contradicts an outstanding
+       receive obligation on the protocol *)
+    iIntros "[Hlc Himpl]". dsp_openc.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
     simpl in *. simplify_eq.
-    iDestruct (iProto_recv with "Hctx Hp") as "Hp".
-    iMod "Hp" as (xs) "(Hctx & Hown & Hm)". iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
-      iPureIntro. simpl in *. by simplify_eq. }
+    iDestruct (iProto_recv_end_inv_l with "Hctx Hp Hcloser") as "H".
     iDestruct "H£s" as "[H£ H£s]".
-    iCombine "Hown Hm" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[Hown Hm]".
-    rewrite iMsg_base_eq.
-    iDestruct (iMsg_texist_exist with "Hm") as (x <-) "[Hp HP]".
-    simpl in *. simplify_eq.
-    iApply "HΦ".
-    iDestruct "H£s" as "[H£ H£s]".
-    rewrite later_equivI_1.
-    iCombine "HP Hp" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[HP Hp]".
-    iModIntro. iRewrite "Hp". by iFrame "#∗".
-  - done.
-  - done.
-  - done.
-  - destruct drain.
-    { simpl in *. simplify_eq.
-      iDestruct (iProto_recv_end_inv_l with "Hctx Hp Hcloser") as "H".
-      iDestruct "H£s" as "[H£ H£s]".
-      iMod (lc_fupd_elim_later with "H£ H") as "[]". }
-    simpl in *. simplify_eq.
-    iIntros "Hownr".
-    iDestruct (iProto_recv with "Hctx Hp") as "Hp".
-    iMod "Hp" as (xs) "(Hctx & Hown & Hm)". iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
-      iPureIntro. simpl in *. by simplify_eq. }
-    iDestruct "H£s" as "[H£ H£s]".
-    iCombine "Hown Hm" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[Hown Hm]".
-    rewrite iMsg_base_eq.
-    iDestruct (iMsg_texist_exist with "Hm") as (x <-) "[Hp HP]".
-    simpl in *. simplify_eq.
-    iApply "HΦ".
-    iDestruct "H£s" as "[H£ H£s]".
-    rewrite later_equivI_1.
-    iCombine "HP Hp" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[HP Hp]".
-    iModIntro. iRewrite "Hp". by iFrame "#∗".
+    iMod (lc_fupd_elim_later with "H£ H") as "[]".
 Qed.
 
 Lemma wp_dsp_recv {TT:tele}
@@ -415,27 +410,42 @@ Lemma wp_dsp_close γ (lr_chan rl_chan : loc) (p : iProto Σ V) Φ :
 Proof using W.
   iIntros "Hc HΦ".
   iDestruct "Hc" as  "(#(Hcl&Hcr&HI)&Hp)".
-  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-  iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-  iApply fupd_mask_intro; [solve_ndisj|].
-  iIntros "Hclose'".
-  iModIntro.
-  iExists _. iFrame.
-  destruct lr_state; try done.
-  - iIntros "Hownl".
-    iMod "Hclose'".
-    iMod ("Hclose" with "[Hownl Hownr Hcloser Hctx Hp]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iFrame "Hp". iSplit; [done|].
+  rewrite /close_au. repeat iSplit.
+  - (* close_idle_au : Idle -> Closed [] *)
+    iIntros "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (@chanstate.Closed V []) with "Hownl Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; lia | ].
+    iMod ("Hclose" with "[H1 Hownr Hcloser Hctx Hp]") as "_".
+    { iIntros "!>". iExists _,_,_,_. iFrame "H1 ∗". try iFrame "Hp". iSplit; [done|].
       iPureIntro. simpl in *. by simplify_eq. }
-    iApply "HΦ". by iFrame "#∗".
-  - iIntros "Hownl".
-    iMod "Hclose'".
-    iMod ("Hclose" with "[Hownl Hownr Hcloser Hctx Hp]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iFrame "Hp". iSplit; [done|].
+    iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
+  - (* close_buf_au : Buffered buf -> Closed buf *)
+    iIntros (buf) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %[Hlen Hpos].
+    iMod (own_chan_halves_update (chanstate.Closed buf) with "Hownl Himpl")
+      as "[H1 H2]";
+      [ destruct buf; simpl in Hlen |- *; [ lia | split; lia ] | ].
+    iMod ("Hclose" with "[H1 Hownr Hcloser Hctx Hp]") as "_".
+    { iIntros "!>". iExists _,_,_,_. iFrame "H1 ∗". try iFrame "Hp". iSplit; [done|].
       iPureIntro. simpl in *. by simplify_eq. }
-    iApply "HΦ". by iFrame "#∗".
-  - iDestruct (iProto_own_excl with "Hp Hclosel") as "[]".
+    iModIntro. iFrame "H2". iApply "HΦ". by iFrame "#∗".
+  - (* close_closed_au : the invariant already holds [iProto_own END] *)
+    iIntros (drain) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownl Himpl") as %->.
+    iDestruct (iProto_own_excl with "Hp Hclosel") as "[]".
 Qed.
+
+(* With the protocol ended the peer has nothing in flight, so every arm naming a
+   nonempty rl-buffer is contradictory; only the drained-closed arm fires. *)
+Local Ltac dsp_end_absurd :=
+  simpl in *; simplify_eq;
+  iDestruct (iProto_end_inv_l with "Hctx Hp") as "H";
+  iDestruct "H£s" as "[H£ H£s]";
+  iMod (lc_fupd_elim_later with "H£ H") as %?;
+  by simplify_eq.
 
 (** Endpoint receives on a closed or ended channel *)
 Lemma wp_dsp_recv_end γ (lr_chan rl_chan : loc) Φ :
@@ -446,73 +456,50 @@ Lemma wp_dsp_recv_end γ (lr_chan rl_chan : loc) Φ :
 Proof using W.
   iIntros "H£s Hc HΦ".
   iDestruct "Hc" as "(#(Hcl&Hcr&HI)&Hp)".
-  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-  iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-  iApply fupd_mask_intro; [solve_ndisj|].
-  iIntros "Hclose'".
-  iModIntro.
-  iExists _. iFrame.
-  destruct rl_state; try done.
-  - destruct buff; [done|].
-    destruct vsr; [done|].
-    iIntros "Hownr".
-    iDestruct (iProto_end_inv_l with "Hctx Hp") as "H".
-    iDestruct "H£s" as "[H£ H£s]".
-    iMod (lc_fupd_elim_later with "H£ H") as %?.
-    by simplify_eq.
-  - iIntros "Hownr".
-    iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au *)
+    iIntros (w) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->. dsp_end_absurd.
+  - (* recv_slow_path_au : the offer can be posted, but never accepted *)
+    iIntros "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (@chanstate.RcvWait V) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; lia | ].
+    iMod ("Hclose" with "[Hownl H1 Hclosel Hcloser Hctx]") as "_".
+    { iIntros "!>". iExists _,_,_,_. iFrame "H1 ∗". iSplit; [done|].
       iPureIntro. simpl in *. by simplify_eq. }
-    iModIntro.
+    iModIntro. iFrame "H2".
+    iIntros (w) "[Hlc Himpl]".
     iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-    iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-    iDestruct "H£s" as "[H£ H£s]".
-    iMod (lc_fupd_elim_later with "H£ Hctx") as "Hctx".
-    iApply fupd_mask_intro; [solve_ndisj|].
-    iIntros "Hclose'".
-    iFrame.
-    destruct rl_state; try done.
-    + iIntros "!> Hownr".
-      simpl in *. simplify_eq.
-      iDestruct (iProto_end_inv_l with "Hctx Hp") as "H".
-      iDestruct "H£s" as "[H£ H£s]".
-      iMod (lc_fupd_elim_later with "H£ H") as %?.
-      by simplify_eq.
-    + destruct drain; last first.
-      { simpl in *. simplify_eq.
-        iDestruct (iProto_end_inv_l with "Hctx Hp") as "H".
-        iDestruct "H£s" as "[H£ H£s]".
-        iIntros "!>". eauto. }
-      iIntros "!> Hownr".
-      iMod "Hclose'".
-      iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-      { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
-        iPureIntro. simpl in *. by simplify_eq. }
-      iApply "HΦ". by iFrame "#∗".
-  - iIntros "Hownr".
-    simpl in *.
-    simplify_eq.
-    iDestruct (iProto_end_inv_l with "Hctx Hp") as "H".
-    iDestruct "H£s" as "[H£ H£s]".
-    iMod (lc_fupd_elim_later with "H£ H") as %?.
-    by simplify_eq.
-  - destruct drain; last first.
-    { simpl in *.
-      simplify_eq.
-      iDestruct (iProto_end_inv_l with "Hctx Hp") as "H".
-      iDestruct "H£s" as "[H£ H£s]".
-      iMod (lc_fupd_elim_later with "H£ H") as %?.
-      by simplify_eq. }
+    iMod (lc_fupd_elim_later with "Hlc IH") as "IH".
+    iDestruct "IH" as (????)
+      "(%Hbml2 & %Hbmr2 & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->. dsp_end_absurd.
+  - (* recv_deq_au *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->. dsp_end_absurd.
+  - (* recv_drain_au *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->. dsp_end_absurd.
+  - (* recv_closed_au : drained and closed, so the receive fails *)
+    iIntros "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
     simpl in *. simplify_eq.
-    iIntros "Hownr".
-    iMod "Hclose'" as "_".
     iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
     { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|].
       iPureIntro. simpl in *. by simplify_eq. }
-    iApply "HΦ". by iFrame "#∗".
+    iModIntro. iFrame "Himpl". iApply "HΦ". by iFrame "#∗".
 Qed.
+
+(* Same shape, but here the *invariant* owns [iProto_own END]; the endpoint is a
+   bare token, so the empty-queue fact comes from [Hclosel] rather than [Hp]. *)
+Local Ltac dsp_closed_vsr ls :=
+  iCombine "Hctx Hclosel" as "H";
+  iDestruct "H£s" as "[H£ H£s]";
+  iMod (lc_fupd_elim_later with "H£ H") as "[Hctx Hclosel]";
+  destruct ls; (try by iDestruct (token_exclusive with "Hp Hclosel") as "[]");
+  iDestruct (iProto_end_inv_l with "Hctx Hclosel") as "#>->".
 
 (** Endpoint receives on a closed or ended channel *)
 Lemma wp_dsp_recv_closed γ (lr_chan rl_chan : loc) Φ :
@@ -523,49 +510,43 @@ Lemma wp_dsp_recv_closed γ (lr_chan rl_chan : loc) Φ :
 Proof using W.
   iIntros "H£s Hc HΦ".
   iDestruct "Hc" as "(#(Hcl&Hcr&HI)&Hp)".
-  iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-  iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-  iCombine "Hctx Hclosel" as "H".
-  iDestruct "H£s" as "[H£ H£s]".
-  iMod (lc_fupd_elim_later with "H£ H") as "[Hctx Hclosel]".
-  destruct lr_state; try by iDestruct (token_exclusive with "Hp Hclosel") as "[]".
-  iDestruct (iProto_end_inv_l with "Hctx Hclosel") as "#>%".
-  iApply fupd_mask_intro; [solve_ndisj|].
-  iIntros "Hclose'".
-  iModIntro.
-  iExists _. iFrame.
-  destruct rl_state; try done.
-  - simpl in *. simplify_eq. iFrame. done.
-  - simpl in *. simplify_eq.
-    iIntros "Hownr".
-    iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|]. by iFrame. }
-    iModIntro.
+  rewrite /recv_au. repeat iSplit.
+  - (* recv_fast_path_au *)
+    iIntros (w) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state. simpl in *. by simplify_eq.
+  - (* recv_slow_path_au : the offer can be posted, but never accepted *)
+    iIntros "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state.
+    iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+    iMod (own_chan_halves_update (@chanstate.RcvWait V) with "Hownr Himpl")
+      as "[H1 H2]"; [ simpl in Hcap |- *; lia | ].
+    iMod ("Hclose" with "[Hownl H1 Hclosel Hcloser Hctx]") as "_".
+    { iIntros "!>". iExists _,_,_,_. iFrame "H1 ∗". iSplit; [done|]. by iFrame. }
+    iModIntro. iFrame "H2".
+    iIntros (w) "[Hlc Himpl]".
     iMod (inv_acc with "HI") as "[IH Hclose]"; [solve_ndisj|].
-    iDestruct "IH" as (????) "(>%&>%&Hownl&Hownr&Hclosel&Hcloser&Hctx)".
-    iDestruct "H£s" as "[H£ H£s]".
-    iCombine "Hctx Hclosel" as "H".
-    iMod (lc_fupd_elim_later with "H£ H") as "[Hctx Hclosel]".
-    iApply fupd_mask_intro; [solve_ndisj|].
-    iIntros "Hclose'".
-    iFrame.
-    destruct lr_state; try by iDestruct (token_exclusive with "Hp Hclosel") as "[]".
-    iDestruct (iProto_end_inv_l with "Hctx Hclosel") as "#>->".
-    destruct rl_state; try done.
-    simpl in *. simplify_eq.
-    iIntros "!> Hownr".
-    iMod "Hclose'" as "_".
+    iMod (lc_fupd_elim_later with "Hlc IH") as "IH".
+    iDestruct "IH" as (????)
+      "(%Hbml2 & %Hbmr2 & Hownl & Hownr & Hclosel & Hcloser & Hctx)".
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state. simpl in *. by simplify_eq.
+  - (* recv_deq_au *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state. simpl in *. by simplify_eq.
+  - (* recv_drain_au *)
+    iIntros (w rest) "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state. simpl in *. by simplify_eq.
+  - (* recv_closed_au : drained and closed, so the receive fails *)
+    iIntros "[Hlc Himpl]". dsp_open.
+    iDestruct (own_chan_agree with "Hownr Himpl") as %->.
+    dsp_closed_vsr lr_state.
     iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
     { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|]. by iFrame. }
-    iApply "HΦ". by iFrame "#∗".
-  - simpl in *. by simplify_eq.
-  - simpl in *. simplify_eq.
-    iIntros "Hownr".
-    iMod "Hclose'" as "_".
-    iMod ("Hclose" with "[Hownl Hownr Hclosel Hcloser Hctx]") as "_".
-    { iIntros "!>". iExists _,_,_,_. iFrame "Hownr ∗". iSplit; [done|]. by iFrame. }
-    iApply "HΦ". by iFrame "#∗".
+    iModIntro. iFrame "Himpl". iApply "HΦ". by iFrame "#∗".
 Qed.
 
 Lemma wp_dsp_recv_false (b : bool) γ (lr_chan rl_chan : loc) Φ :
@@ -574,7 +555,6 @@ Lemma wp_dsp_recv_false (b : bool) γ (lr_chan rl_chan : loc) Φ :
   ((if b then (lr_chan,rl_chan) ↣{γ} END else ↯{γ} (lr_chan,rl_chan)) -∗ Φ (zero_val V) false) -∗
   recv_au γ.(chan_rl_name) V Φ.
 Proof using W. destruct b; [apply wp_dsp_recv_end|apply wp_dsp_recv_closed]. Qed.
-
 
 End dsp.
 

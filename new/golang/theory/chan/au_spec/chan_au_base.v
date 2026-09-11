@@ -9,20 +9,20 @@ Module chanstate.
 Inductive t (V : Type) : Type :=
 | Buffered (buff : list V)     (* Buffered channel with pending messages *)
 | Idle                        (* Empty unbuffered channel, ready for operations *)
-| SndPending (v : V)          (* Unbuffered channel with sender waiting *)
-| RcvPending                 (* Unbuffered channel with receiver waiting *)
-| SndCommit (v : V)           (* Sender committed, waiting for receiver to complete *)
-| RcvCommit                  (* Receiver committed, waiting for sender to complete *)
+| SndWait (v : V)          (* Unbuffered channel with sender waiting *)
+| RcvWait                 (* Unbuffered channel with receiver waiting *)
+| SndDone (v : V)           (* Sender committed, waiting for receiver to complete *)
+| RcvDone                  (* Receiver committed, waiting for sender to complete *)
 | Closed (drain : list V)  (* Closed channel, possibly drain remaining messages *)
 .
 #[global] Instance witness V : Inhabited (t V) := populate!.
 
 Global Arguments Buffered {V}.
 Global Arguments Idle {V}.
-Global Arguments SndPending {V}.
-Global Arguments RcvPending {V}.
-Global Arguments SndCommit {V}.
-Global Arguments RcvCommit {V}.
+Global Arguments SndWait {V}.
+Global Arguments RcvWait {V}.
+Global Arguments SndDone {V}.
+Global Arguments RcvDone {V}.
 Global Arguments Closed {V}.
 
 End chanstate.
@@ -31,7 +31,8 @@ End chanstate.
     This is slightly different from the mathematical representation
     in that we don't go to the SndWait state logically until an offer
     is about to be accepted. *)
-Inductive chan_phys_state (V : Type) : Type :=
+Module chanphys.
+Inductive t (V : Type) : Type :=
 | Buffered (buffer : list V)     (* Channel with buffered messages *)
 | Idle                        (* Ready for operations *)
 | SndWait (v : V)            (* Sender offers *)
@@ -48,6 +49,8 @@ Global Arguments SndDone {V}.
 Global Arguments RcvDone {V}.
 Global Arguments Closed {V}.
 Global Arguments Buffered {V}.
+
+End chanphys.
 
 (** The offer protocol coordinates handshakes between senders and receivers
     in unbuffered channels. An "offer" represents a pending operation that
@@ -86,7 +89,7 @@ Definition chanstate (q : Qp) (s : chanstate.t V) : iProp Σ :=
 Definition chan_cap_valid (s : chanstate.t V) (cap : Z) : Prop :=
   match s with
   | chanstate.Buffered buf =>
-      (* Buffered is only used for buffered channels, and buffer size is bounded
+      (* chanphys.Buffered is only used for buffered channels, and buffer size is bounded
       by capacity *)
       (length buf ≤ cap)%Z ∧ (0 < cap)
   | chanstate.Closed [] => (0 ≤ cap)
@@ -102,206 +105,150 @@ Definition own_chan (s: chanstate.t V) : iProp Σ :=
   "Hchanrepfrag" ∷ chanstate (1/2) s ∗
   "%Hcapvalid" ∷ ⌜ chan_cap_valid s (sint.Z $ chan_cap γ) ⌝.
 
-(** Inner atomic update for receive completion (second phase of handshake) *)
-Definition recv_nested_au (Φ : V → bool → iProp Σ) : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hocinner" ∷ own_chan s ∗
-     "Hcontinner" ∷
-    (match s with
-    (* Case: Sender has committed, complete the exchange *)
-    | chanstate.SndCommit v => own_chan chanstate.Idle ={∅,⊤}=∗ Φ v true
-    (* Case: Channel is closed with no messages *)
-    | chanstate.Closed [] => own_chan s ={∅,⊤}=∗ Φ (zero_val V) false
-    | _ => True
-    end).
+(** ** Per-transition ("conjunctive") atomic updates.
 
-(** Slow path receive: may need to block and wait *)
-Definition recv_au (Φ : V → bool → iProp Σ) : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hoc" ∷ own_chan s ∗
-     "Hcont" ∷
-    (match s with
-    (* Case: Sender is waiting, can complete immediately *)
-    | chanstate.SndPending v =>
-          own_chan chanstate.RcvCommit ={∅,⊤}=∗ Φ v true
-    (* Case: Channel is idle, need to wait for sender *)
-    | chanstate.Idle =>
-          own_chan (chanstate.RcvPending) ={∅,⊤}=∗
-              recv_nested_au Φ
-    (* Case: Channel is closed *)
-    | chanstate.Closed [] => own_chan s ={∅,⊤}=∗ Φ (zero_val V) false
-    (* Case: Closed but still have values to drain *)
-    | chanstate.Closed (v::rest) => (own_chan (chanstate.Closed rest) ={∅,⊤}=∗ Φ v true)
-    (* Case: Buffered channel with values in buffer *)
-    | chanstate.Buffered (v::rest) => (own_chan (chanstate.Buffered rest) ={∅,⊤}=∗ Φ v true)
-    | _ => True
-    end).
+    These are the AUs the program specs are proved against.  Each names a
+    concrete pre-state with no [⌜s = _⌝] guard, because it *receives* the mutex
+    invariant's half of [own_chan] and hands back a half at the post-state,
+    rather than the client handing its own half out.  The implementation always
+    knows the state before it fires an AU (it holds the lock, and the mutex
+    invariant holds the other half), so it selects the matching conjunct.
 
-(** Fast path receive: immediate completion when possible *)
-Definition nonblocking_recv_au (Φ : V → bool → iProp Σ) Φnotready : iProp Σ :=
-  (|={⊤,∅}=>
-     ▷∃ s, "Hoc" ∷ own_chan s ∗
-           "Hcont" ∷
-             match s with
-             (* Case: Sender is waiting, can complete immediately *)
-             | chanstate.SndPending v =>
-                 own_chan chanstate.RcvCommit ={∅,⊤}=∗ Φ v true
-             (* Case: Channel is closed *)
-             | chanstate.Closed [] => own_chan s ={∅,⊤}=∗ Φ (zero_val V) false
-             (* Case: Channel is closed but still has values to drain *)
-             | chanstate.Closed (v::rest) => (own_chan (chanstate.Closed rest) ={∅,⊤}=∗ Φ v true)
-             (* Case: Buffered channel with values *)
-             | chanstate.Buffered (v::rest) => (own_chan (chanstate.Buffered rest) ={∅,⊤}=∗ Φ v true)
-             | _ => True
-             end) ∧
-  Φnotready.
+    A client discharges every conjunct in every state: agreement between the two
+    halves either says the pre-state matches or yields a contradiction -- so the
+    arms are exactly the reachable transitions, rather than one case per
+    physical state. *)
 
-(** See [nonblocking_send_au_alt] documentation below.  *)
-Definition nonblocking_recv_au_alt (Φ : V → bool → iProp Σ) Φnotready : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hoc" ∷ own_chan s ∗
-     "Hcont" ∷
-    (match s with
-    (* Case: Sender is waiting, can complete immediately *)
-    | chanstate.SndPending v =>
-          own_chan chanstate.RcvCommit ={∅,⊤}=∗ Φ v true
-    (* Case: Channel is closed *)
-    | chanstate.Closed [] => own_chan s ={∅,⊤}=∗ Φ (zero_val V) false
-    (* Case: Channel is closed but still has values to drain *)
-    | chanstate.Closed (v::rest) => (own_chan (chanstate.Closed rest) ={∅,⊤}=∗ Φ v true)
-    (* Case: Buffered channel with values *)
-    | chanstate.Buffered (v::rest) => (own_chan (chanstate.Buffered rest) ={∅,⊤}=∗ Φ v true)
-    | _ => (own_chan s ={∅,⊤}=∗ Φnotready)
-    end).
+Definition send_fast_path_au (Φ : iProp Σ) : iProp Σ :=
+  £1 ∗ own_chan chanstate.RcvWait ={⊤}=∗ own_chan (chanstate.SndDone v) ∗ Φ.
 
-(** Inner atomic update for send completion (second phase of handshake) *)
-Definition send_nested_au (Φ : iProp Σ) : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hocinner" ∷ own_chan s ∗
-     "Hcontinner" ∷
-    (match s with
-    (* Case: Receiver has committed, complete the exchange *)
-    | chanstate.RcvCommit =>
-           own_chan chanstate.Idle ={∅,⊤}=∗ Φ
-    (* Case: Channel is closed, operation fails *)
-    | chanstate.Closed drain => False
-    | _ => True
-    end).
+(** A two-phase AU.  Phase one posts the offer; the receiver that accepts it
+    hands phase two back to the sender, which fires it on relocking once the
+    receiver has committed.  Neither phase has a "closed" case: [tryClose] only
+    closes from Idle/Buffered and spins on SndWait, so a parked send offer
+    cannot be closed underneath. *)
+Definition send_slow_path_au (Φ : iProp Σ) : iProp Σ :=
+  £1 ∗ own_chan chanstate.Idle ={⊤}=∗
+    (* phase one: Idle -> SndWait v *)
+    own_chan (chanstate.SndWait v) ∗
+    (* phase two: RcvDone -> Idle, once the receiver has committed *)
+    (£1 ∗ own_chan chanstate.RcvDone ={⊤}=∗ own_chan chanstate.Idle ∗ Φ).
 
-(** Slow path send: may need to block and wait *)
+(** The capacity fact is supplied by the implementation, which has just checked
+    there is room; [own_chan (Buffered buf)] only bounds [buf] by the capacity. *)
+Definition send_enq_au (Φ : iProp Σ) : iProp Σ :=
+  ∀ buf, £1 ∗ ⌜ (length buf < sint.Z $ chan_cap γ)%Z ⌝ ∗
+         own_chan (chanstate.Buffered buf) ={⊤}=∗
+         own_chan (chanstate.Buffered (buf ++ [v])) ∗ Φ.
+
+Definition send_closed_au : iProp Σ :=
+  ∀ drain, £1 ∗ own_chan (chanstate.Closed drain) ={⊤}=∗ False.
+
 Definition send_au (Φ : iProp Σ) : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hoc" ∷ own_chan s ∗
-     "Hcont" ∷
-    (match s with
-    (* Case: Receiver is waiting, can complete immediately *)
-    | chanstate.RcvPending =>
-        own_chan (chanstate.SndCommit v) ={∅,⊤}=∗ Φ
-    (* Case: Channel is idle, need to wait for receiver *)
-    | chanstate.Idle =>
-          own_chan (chanstate.SndPending v) ={∅,⊤}=∗
-              send_nested_au Φ
-    (* Case: Channel is closed, client must rule this out *)
-    | chanstate.Closed drain => False
-    (* Case: Buffered channel *)
-    | chanstate.Buffered buff =>
-        (* own_chan implies new buffer size is <= cap, so the whole update is
-        equivalent to True if no space is available *)
-        (own_chan (chanstate.Buffered (buff ++ [v])) ={∅,⊤}=∗ Φ)
-    | _ => True
-    end).
+  send_fast_path_au Φ ∧ send_slow_path_au Φ ∧ send_enq_au Φ ∧ send_closed_au.
 
-(** Fast path send: immediate completion when possible *)
-Definition nonblocking_send_au Φ Φnotready : iProp Σ :=
-  (|={⊤,∅}=>
-     ▷∃ s, "Hoc" ∷ own_chan s ∗
-           "Hcont" ∷
-             match s with
-             (* Case: Receiver is waiting, can complete immediately *)
-             | chanstate.RcvPending =>
-                 own_chan (chanstate.SndCommit v) ={∅,⊤}=∗ Φ
-             (* Case: Channel is closed, client must rule this out *)
-             | chanstate.Closed drain => False
-             (* Case: Buffered channel *)
-             | chanstate.Buffered buff =>
-                   (own_chan (chanstate.Buffered (buff ++ [v])) ={∅,⊤}=∗ Φ)
-             | _ => True
-             end) ∧
-  Φnotready.
+Definition recv_fast_path_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  ∀ w, £1 ∗ own_chan (chanstate.SndWait w) ={⊤}=∗
+       own_chan chanstate.RcvDone ∗ Φ w true.
 
-(* Special case update that only works if the channel is known to be buffered.
-   This is only an illustrative example. Proofs and specs should always use [send_au_slow] *)
-Definition buffered_send_au Φ : iProp Σ :=
-  |={⊤,∅}=>
-    ▷∃ s, "Hoc" ∷ own_chan s ∗
-          "Hcont" ∷
-            match s with
-            | chanstate.Buffered buf => own_chan (chanstate.Buffered (buf ++ [v])) ={∅,⊤}=∗ Φ
-            | chanstate.Closed _ => False
-            | _ => True
-            end.
+(** The two-phase AU for receive, mirroring [send_slow_path_au]. *)
+Definition recv_slow_path_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  £1 ∗ own_chan chanstate.Idle ={⊤}=∗
+    (* phase one: Idle -> RcvWait *)
+    own_chan chanstate.RcvWait ∗
+    (* phase two: SndDone w -> Idle, once the sender has committed *)
+    (∀ w, £1 ∗ own_chan (chanstate.SndDone w) ={⊤}=∗
+          own_chan chanstate.Idle ∗ Φ w true).
 
-(** This is an alternate specification for nonblocking chan send that allows for
-    proving a caller-chosen [Φnotready] in case the send does not occur. If no
-    cases are ready in the containing select statement, the [Φnotready]s will be
-    passed as a precondition to the default handler, allowing for reasoning
-    about programs in which it should be _impossible_ to reach the default.
+Definition recv_deq_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  ∀ w rest, £1 ∗ own_chan (chanstate.Buffered (w :: rest)) ={⊤}=∗
+            own_chan (chanstate.Buffered rest) ∗ Φ w true.
 
-    This is not implied by nor does it imply [nonblocking_send_au].
-    - [nonblocking_send_au -∗ nonblocking_send_au_alt]: the default spec does not provide
-      [|={∅,⊤}=>] in the notready case, but it's necessary to somehow close all
-      invariants in [nonblocking_send_au_alt].
-    - [nonblocking_send_au_alt -∗ nonblocking_send_au]: under [nonblocking_send_au_alt], the notready
-      predicate is only known to be true if the channel is _actually_ not ready,
-      whereas [nonblocking_send_au] requires proving it's always OK to skip a case.
+Definition recv_drain_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  ∀ w rest, £1 ∗ own_chan (chanstate.Closed (w :: rest)) ={⊤}=∗
+            own_chan (chanstate.Closed rest) ∗ Φ w true.
 
-    The writer of this spec does not know a different au which is weaker than
-    both [nonblocking_send_au] and [nonblocking_send_au_alt] and which is provable with
-    [TrySend]. If such a thing exists, it may enable having a canonical spec for
-    nonblocking channel operations. To be worth it, it would also require having
-    a canonical version of the select spec, for which there are currently two
-    (see [golang/theory/chan.v]). *)
-Definition nonblocking_send_au_alt Φ Φnotready : iProp Σ :=
-  |={⊤,∅}=>
-    ▷∃ s, "Hoc" ∷ own_chan s ∗
-          "Hcont" ∷
-            match s with
-            (* Case: Receiver is waiting, can complete immediately *)
-            | chanstate.RcvPending =>
-                own_chan (chanstate.SndCommit v) ={∅,⊤}=∗ Φ
-            (* Case: Channel is closed, client must rule this out *)
-            | chanstate.Closed drain => False
-            (* Case: Buffered channel *)
-            | chanstate.Buffered buff =>
-                if decide (length buff < sint.Z $ chan_cap γ) then
-                  (own_chan (chanstate.Buffered (buff ++ [v])) ={∅,⊤}=∗ Φ)
-                else
-                  (own_chan s ={∅,⊤}=∗ Φnotready)
-            | _ => (own_chan s ={∅,⊤}=∗ Φnotready)
-            end.
+Definition recv_closed_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  £1 ∗ own_chan (chanstate.Closed []) ={⊤}=∗
+       own_chan (chanstate.Closed []) ∗ Φ (zero_val V) false.
+
+Definition recv_au (Φ : V → bool → iProp Σ) : iProp Σ :=
+  recv_fast_path_au Φ ∧ recv_slow_path_au Φ ∧ recv_deq_au Φ ∧ recv_drain_au Φ ∧ recv_closed_au Φ.
+
+Definition close_idle_au (Φ : iProp Σ) : iProp Σ :=
+  £1 ∗ own_chan chanstate.Idle ={⊤}=∗ own_chan (chanstate.Closed []) ∗ Φ.
+
+Definition close_buf_au (Φ : iProp Σ) : iProp Σ :=
+  ∀ buf, £1 ∗ own_chan (chanstate.Buffered buf) ={⊤}=∗
+         own_chan (chanstate.Closed buf) ∗ Φ.
+
+Definition close_closed_au : iProp Σ :=
+  ∀ drain, £1 ∗ own_chan (chanstate.Closed drain) ={⊤}=∗ False.
 
 Definition close_au (Φ : iProp Σ) : iProp Σ :=
-   |={⊤,∅}=>
-    ▷∃ s, "Hocinner" ∷ own_chan s ∗
-     "Hcontinner" ∷
-    (match s with
-    (* Case: Ready to close unbuffered *)
-    | chanstate.Idle =>
-           own_chan (chanstate.Closed []) ={∅,⊤}=∗ Φ
-    (* Case: Buffered, go to drain *)
-    | chanstate.Buffered buff =>
-          own_chan (chanstate.Closed buff) ={∅,⊤}=∗ Φ
-    (* Case: Channel is closed already, panic *)
-    | chanstate.Closed drain => False
-    | _ => True
-    end).
+  close_idle_au Φ ∧ close_buf_au Φ ∧ close_closed_au.
+
+(** ** Nonblocking variants.
+
+    A nonblocking operation posts no offer, so it is the same choice of
+    transitions minus the slow path.  The two forms differ in exactly one
+    conjunct: the plain one is handed [Φnotready] unconditionally, so the client
+    must be prepared for the case to be skipped no matter what; the [Alt] one
+    gets it only from a state that really is not ready, which is what lets a
+    client prove a select's default branch unreachable.
+
+    Splitting the transitions apart is what makes these two comparable at all.
+    While the not-ready case was a branch of the same [match], it shared the one
+    [∃ s, own_chan s] opening with every other case, and neither form implied
+    the other; both had to be shipped.  Given its own conjunct it opens nothing,
+    and [nonblocking_send_au -∗ nonblocking_send_au_alt] goes through
+    ([nonblocking_send_au_to_alt] below), so only the weaker [Alt] form is
+    primitive and the plain one is a corollary.
+
+    [send_not_ready] / [recv_not_ready] are the states with no enabled
+    transition -- note a closed channel is *not* among them, since sending on
+    one panics rather than blocking. *)
+
+Definition send_not_ready (s : chanstate.t V) : Prop :=
+  match s with
+  | chanstate.RcvWait => False
+  | chanstate.Closed _ => False
+  | chanstate.Buffered buf => ¬ (length buf < sint.Z $ chan_cap γ)%Z
+  | _ => True
+  end.
+
+Definition recv_not_ready (s : chanstate.t V) : Prop :=
+  match s with
+  | chanstate.SndWait _ => False
+  | chanstate.Closed _ => False
+  | chanstate.Buffered [] => True
+  | chanstate.Buffered (_ :: _) => False
+  | _ => True
+  end.
+
+(** The stutter transition: the state is not ready, so nothing moves and the
+    caller learns it. *)
+Definition send_not_ready_au (Φnotready : iProp Σ) : iProp Σ :=
+  ∀ s, £1 ∗ ⌜ send_not_ready s ⌝ ∗ own_chan s ={⊤}=∗ own_chan s ∗ Φnotready.
+
+Definition recv_not_ready_au (Φnotready : iProp Σ) : iProp Σ :=
+  ∀ s, £1 ∗ ⌜ recv_not_ready s ⌝ ∗ own_chan s ={⊤}=∗ own_chan s ∗ Φnotready.
+
+Definition nonblocking_send_au (Φ Φnotready : iProp Σ) : iProp Σ :=
+  send_fast_path_au Φ ∧ send_enq_au Φ ∧ send_closed_au ∧ Φnotready.
+
+Definition nonblocking_send_au_alt (Φ Φnotready : iProp Σ) : iProp Σ :=
+  send_fast_path_au Φ ∧ send_enq_au Φ ∧ send_closed_au ∧ send_not_ready_au Φnotready.
+
+Definition nonblocking_recv_au (Φ : V → bool → iProp Σ) (Φnotready : iProp Σ) : iProp Σ :=
+  recv_fast_path_au Φ ∧ recv_deq_au Φ ∧ recv_drain_au Φ ∧ recv_closed_au Φ ∧ Φnotready.
+
+Definition nonblocking_recv_au_alt (Φ : V → bool → iProp Σ) (Φnotready : iProp Σ) : iProp Σ :=
+  recv_fast_path_au Φ ∧ recv_deq_au Φ ∧ recv_drain_au Φ ∧ recv_closed_au Φ ∧ recv_not_ready_au Φnotready.
 
 End au_defns.
 
 Global Arguments own_chan {_ _ _ _ _} (γ V) (s).
-Global Arguments send_au {_ _ _ _ _ _} (γ) {V} (v) (Φ).
-Global Arguments nonblocking_send_au {_ _ _ _ _ _} (γ) {V} (v) (Φ).
-Global Arguments nonblocking_send_au_alt {_ _ _ _ _ _} (γ) {V} (v) (Φ).
 Global Arguments chan_cap_valid {_} (s cap).
 
 Section defns.
@@ -314,55 +261,55 @@ Context `{!ZeroVal V} `{!TypedPointsto V} `{!IntoValTyped V t}.
 
 (** Maps physical channel states to their heap representations.
     Each state corresponds to specific field values in the Go struct. *)
-Definition chan_phys (s: chan_phys_state V) : iProp Σ :=
+Definition chan_phys (s: chanphys.t V) : iProp Σ :=
   match s with
-    | Closed [] =>
+    | chanphys.Closed [] =>
         (∃ (slice_val: slice.t),
             "state" ∷ (ch.[channel.Channel.t V , "state"] ↦ (W64 6)) ∗
             "slice" ∷ slice_val ↦* ([] : list V) ∗
             "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
             "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val)
-    | Closed drain =>
+    | chanphys.Closed drain =>
         ∃ (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 6) ∗
         "slice" ∷ slice_val ↦* drain ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | Buffered buff =>
+    | chanphys.Buffered buff =>
         ∃ (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 0) ∗
         "slice" ∷ slice_val ↦* buff ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | Idle =>
+    | chanphys.Idle =>
         ∃ (v:V) (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 1) ∗
         "v" ∷ ch.[channel.Channel.t V, "v"] ↦ v ∗
         "slice" ∷ slice_val ↦* ([] : list V) ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | SndWait v =>
+    | chanphys.SndWait v =>
         ∃ (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 2) ∗
         "v" ∷ ch.[channel.Channel.t V, "v"] ↦ v ∗
         "slice" ∷ slice_val ↦* ([] : list V) ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | RcvWait =>
+    | chanphys.RcvWait =>
         ∃ (v:V) (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 3) ∗
         "v" ∷ ch.[channel.Channel.t V, "v"] ↦ v ∗
         "slice" ∷ slice_val ↦* ([] : list V) ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | SndDone v =>
+    | chanphys.SndDone v =>
         ∃ (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 4) ∗
         "v" ∷ ch.[channel.Channel.t V, "v"] ↦ v ∗
         "slice" ∷ slice_val ↦* ([] : list V) ∗
         "slice_cap" ∷ own_slice_cap V slice_val (DfracOwn 1) ∗
         "buffer" ∷ ch.[channel.Channel.t V, "buffer"] ↦ slice_val
-    | RcvDone =>
+    | chanphys.RcvDone =>
         ∃ (v : V) (slice_val: slice.t),
         "state" ∷ ch.[channel.Channel.t V, "state"] ↦ (W64 5) ∗
         "v" ∷ ch.[channel.Channel.t V, "v"] ↦ v ∗
@@ -382,59 +329,61 @@ Definition saved_offer (q : Qp)
 (** Maps physical states to their logical representations with ghost state.
     This is the key invariant that connects the physical implementation
     to the logical specifications. *)
-Definition chan_logical (s : chan_phys_state V): iProp Σ :=
+Definition chan_logical (s : chanphys.t V): iProp Σ :=
   match s with
-  | Idle =>
+  | chanphys.Idle =>
        ∃ (Φr: V → bool → iProp Σ),
            "Hoffer" ∷ saved_offer 1 None True True ∗
            "Hpred" ∷ saved_pred_own γ.(offer_parked_pred_name) (DfracOwn 1) (uncurry Φr) ∗
             own_chan γ V chanstate.Idle
 
-  | SndWait v =>
+  | chanphys.SndWait v =>
        ∃ (P: iProp Σ) (Φ: iProp Σ) (Φr: V → bool → iProp Σ),
           "Hoffer" ∷ saved_offer (1/2) (Some (Snd v)) P Φ ∗
           "HP" ∷ P ∗
           "Hpred" ∷ saved_pred_own γ.(offer_parked_pred_name) (DfracOwn 1) (uncurry Φr) ∗
-          "Hau" ∷ (P -∗ send_au γ v Φ) ∗
+          "Hau" ∷ (P -∗ send_slow_path_au γ V v Φ) ∗
            own_chan γ V chanstate.Idle
 
-  | RcvWait =>
+  | chanphys.RcvWait =>
        ∃ (P: iProp Σ) (Φr: V → bool → iProp Σ),
          "Hoffer" ∷ saved_offer (1/2) (Some Rcv) P True ∗
          "HP" ∷ P ∗
          "Hpred" ∷ saved_pred_own γ.(offer_parked_pred_name) (DfracOwn (1/2)) (uncurry Φr) ∗
-         "Hau" ∷ (P -∗ recv_au γ V Φr) ∗
+         "Hau" ∷ (P -∗ recv_slow_path_au γ V Φr) ∗
          own_chan γ V chanstate.Idle
 
-  | SndDone v =>
+  | chanphys.SndDone v =>
        ∃ (P: iProp Σ) (Φr: V → bool → iProp Σ),
        "Hpred" ∷ saved_pred_own γ.(offer_parked_pred_name) (DfracOwn (1/2)) (uncurry Φr) ∗
        "Hoffer" ∷ saved_offer (1/2) (Some Rcv) P True ∗
-       "Hau" ∷ recv_nested_au γ V Φr ∗
-       own_chan γ V (chanstate.SndCommit v)
+       "Hau" ∷ (∀ w, £1 ∗ own_chan γ V (chanstate.SndDone w) ={⊤}=∗
+                     own_chan γ V chanstate.Idle ∗ Φr w true) ∗
+       own_chan γ V (chanstate.SndDone v)
 
-  | RcvDone =>
+  | chanphys.RcvDone =>
        ∃ (P: iProp Σ) (Φ: iProp Σ) (Φr: V → bool → iProp Σ) (v:V),
          "Hoffer" ∷ saved_offer (1/2) (Some (Snd v)) P Φ ∗
          "Hpred" ∷ saved_pred_own γ.(offer_parked_pred_name) (DfracOwn 1) (uncurry Φr) ∗
-         "Hau" ∷ send_nested_au γ V Φ ∗
-       own_chan γ V chanstate.RcvCommit
+         "Hau" ∷ (£1 ∗ own_chan γ V chanstate.RcvDone ={⊤}=∗
+                  own_chan γ V chanstate.Idle ∗ Φ) ∗
+       own_chan γ V chanstate.RcvDone
 
-  | Closed [] =>
+  | chanphys.Closed [] =>
           own_chan γ V (chanstate.Closed []) ∗
            "Hoffer" ∷ (⌜ chan_cap γ = W64 0 ⌝ -∗ saved_offer 1 None True True)
 
-  | Closed drain =>
+  | chanphys.Closed drain =>
           own_chan γ V (chanstate.Closed drain)
 
-  | Buffered buff =>
+  | chanphys.Buffered buff =>
           own_chan γ V (chanstate.Buffered buff)
   end.
 
 (** The main invariant protected by the channel's mutex.
     This connects the physical heap state with the logical state. *)
 Definition chan_inv_inner : iProp Σ :=
-  ∃ (s : chan_phys_state V),
+  ∃ (s : chanphys.t V),
     "phys" ∷ chan_phys s ∗
     "offer" ∷ chan_logical s
 .
@@ -453,25 +402,33 @@ Definition is_chan : iProp Σ :=
 #[local] Transparent is_chan.
 #[local] Typeclasses Transparent is_chan.
 
+(** A nonblocking operation posts no offer, so it needs exactly the blocking
+    conjuncts minus the slow path.  Both directions are pure ∧-projections, and
+    [Φnotready] is [True] because the plain nonblocking form is always free to
+    skip the case. *)
 Lemma blocking_rcv_implies_nonblocking (Φ : V → bool → iProp Σ) :
   recv_au γ V Φ -∗
   nonblocking_recv_au γ V Φ True.
 Proof.
-  iIntros "Hau".
-  iSplitL; last done. iMod "Hau" as (s) "[Hoc Hcont]".
-  iModIntro. iExists s. iFrame "Hoc".
-  destruct s; try done.
+  iIntros "H". rewrite /recv_au /nonblocking_recv_au.
+  iSplit; [| iSplit; [| iSplit; [| iSplit ] ] ].
+  - iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". iRight in "H". iFrame.
+  - done.
 Qed.
 
 Lemma blocking_send_implies_nonblocking (Φ : iProp Σ) (v : V) :
-  send_au γ v Φ -∗
-  nonblocking_send_au γ v Φ True.
+  send_au γ V v Φ -∗
+  nonblocking_send_au γ V v Φ True.
 Proof.
-  iIntros "Hchan".
-  iSplitL; last done.
-  iMod "Hchan" as (s) "[Hoc Hcont]".
-  iModIntro. iExists s. iFrame "Hoc".
-  destruct s; try done.
+  iIntros "H". rewrite /send_au /nonblocking_send_au.
+  iSplit; [| iSplit; [| iSplit ] ].
+  - iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". iFrame.
+  - done.
 Qed.
 
 Lemma offer_idle_to_send parked_prop cont v :
@@ -629,6 +586,41 @@ Proof.
   rewrite /chanstate.
   apply ghost_var_update_halves.
 Qed.
+
+(** The plain nonblocking AU implies the [Alt] one: [Alt] is the weaker
+    precondition, so it is the one the program specs should take.  This is
+    provable only because the not-ready case is its own conjunct -- ∧-introduction
+    proves each conjunct separately from the same resources, so we never need the
+    transition arms and [Φnotready] simultaneously.  In the pattern-matching form
+    they live in one [match] under one fupd, and a single proof would need both
+    at once, which [∧] cannot give. *)
+Lemma nonblocking_send_au_to_alt v Φ Φnotready :
+  nonblocking_send_au γ V v Φ Φnotready -∗ nonblocking_send_au_alt γ V v Φ Φnotready.
+Proof using All.
+  iIntros "H". rewrite /nonblocking_send_au /nonblocking_send_au_alt. repeat iSplit.
+  - iLeft in "H". iFrame.
+  - iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". rewrite /send_not_ready_au.
+    iIntros (s) "(Hlc & %Hnr & Hoc)". iModIntro. iFrame.
+Qed.
+
+Lemma nonblocking_recv_au_to_alt (Φ : V → bool → iProp Σ) Φnotready :
+  nonblocking_recv_au γ V Φ Φnotready -∗ nonblocking_recv_au_alt γ V Φ Φnotready.
+Proof using All.
+  iIntros "H". rewrite /nonblocking_recv_au /nonblocking_recv_au_alt. repeat iSplit.
+  - iLeft in "H". iFrame.
+  - iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". iLeft in "H". iFrame.
+  - iRight in "H". iRight in "H". iRight in "H". iRight in "H".
+    rewrite /recv_not_ready_au.
+    iIntros (s) "(Hlc & %Hnr & Hoc)". iModIntro. iFrame.
+Qed.
+
+Lemma own_chan_cap_valid s :
+  own_chan γ V s -∗ ⌜ chan_cap_valid s (sint.Z $ chan_cap γ) ⌝.
+Proof. rewrite /own_chan. iNamed 1. done. Qed.
 
 (* FIXME: iCombine instances. *)
 Lemma own_chan_agree s s' :

@@ -78,7 +78,7 @@ Qed.
 Lemma wp_send ch v γ:
   ∀ Φ,
   is_chan ch γ V -∗
-  (£1 ∗ £1 ∗ £1 ∗ £1 -∗ send_au γ v (Φ #())) -∗
+  (£1 ∗ £1 ∗ £1 ∗ £1 -∗ send_au γ V v (Φ #())) -∗
   WP chan.send t #ch #v {{ Φ }}.
 Proof using W.
   wp_start as "#Hch".
@@ -124,27 +124,71 @@ Section select_proof.
 Context `{hG: heapGS Σ, !ffi_semantics _ _}.
 Context {sem_fn : GoSemanticsFunctions} {pre_sem : go.PreSemantics}
   {sem : go.ChanSemantics}.
+
+(** ** Per-clause obligations
+
+    Every select rule asks the same thing of each communication clause: name the
+    channel, its element type and its ghost name, prove the clause's expressions
+    really denote that channel and that value, and supply an atomic update whose
+    success continuation is the clause's handler.  The three definitions below
+    differ only in *which* atomic update is demanded. *)
+
+(** Blocking select: the clause must be prepared for any reachable transition. *)
+Definition select_clause_blocking (Ψ : val → iProp Σ) (c : comm_clause) : iProp Σ :=
+  match c with
+  | CommClause (SendCase t chan_expr send_val) handler =>
+      ∃ V ch γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ send_val = #v ∧ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        send_au γ V v (WP handler {{ Ψ }})
+  | CommClause (RecvCase t chan_expr) handler =>
+      ∃ V ch γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        recv_au γ V (λ v ok, WP handler (#v, #ok)%V {{ Ψ }})
+  end.
+
+(** Nonblocking select: a clause may also decline outright, keeping nothing. *)
+Definition select_clause_nonblocking (Ψ : val → iProp Σ) (c : comm_clause) : iProp Σ :=
+  match c with
+  | CommClause (SendCase t chan_expr send_val) handler =>
+      ∃ V ch γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ send_val = #v ∧ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        nonblocking_send_au γ V v (WP handler {{ Ψ }}) True
+  | CommClause (RecvCase t chan_expr) handler =>
+      ∃ V ch γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        nonblocking_recv_au γ V (λ v ok, WP handler (#v, #ok)%V {{ Ψ }}) True
+  end.
+
+(** Nonblocking select, strong form: declining is no longer free.  The clause
+    must look at the channel and hand back [Q] as evidence it was not ready. *)
+Definition select_clause_nonblocking_alt (Ψ : val → iProp Σ) (Q : iProp Σ)
+    (c : comm_clause) : iProp Σ :=
+  match c with
+  | CommClause (SendCase t chan_expr send_val) handler =>
+      ∃ V ch γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ send_val = #v ∧ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        nonblocking_send_au_alt γ V v (WP handler {{ Ψ }}) Q
+  | CommClause (RecvCase t chan_expr) handler =>
+      ∃ V ch γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
+        ⌜ chan_expr = #ch ⌝ ∗
+        is_chan ch γ V ∗
+        nonblocking_recv_au_alt γ V (λ v ok, WP handler (#v, #ok)%V {{ Ψ }}) Q
+  end.
+
 Local Set Default Proof Using "All".
 
-(* The lemmas use Ψ because the original client-provided `send/recv_au` will
+(* The lemmas use Ψ because the original client-provided [send_au]/[recv_au] will
    have some specific postcondition predicate. We don't want to force the caller
-   to transform that into a `send_au` of a different. So, these lemmas are
-   written to take a wand that turns Ψ into Φ. *)
+   to transform that into a [send_au] of a different postcondition. So, these
+   lemmas are written to take a wand that turns Ψ into Φ. *)
 Local Lemma wp_try_comm_clause_blocking c Ψ :
   ∀ Φ,
-  (match c with
-   | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-       ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-     is_chan send_chan γ V ∗
-     send_au γ v (WP send_handler {{ Ψ }})
-   | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-       ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-     is_chan recv_chan γ V ∗
-     recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }})
-   end
-  ) ∧ (Φ (#(), #false)%V) -∗
+  select_clause_blocking Ψ c ∧ (Φ (#(), #false)%V) -∗
   (∀ retv, Ψ retv -∗ Φ (retv, #true)%V) -∗
   WP chan.try_comm_clause c #true {{ Φ }}.
 Proof.
@@ -160,21 +204,27 @@ Proof.
     wp_apply (wp_TrySend with "[$]").
     iSplit.
     + iLeft in "HΦ". iDestruct "HΦ" as "(_ & _ & Hau)".
-      iMod "Hau". iModIntro. iNext. iNamed "Hau".
-      iFrame. destruct s.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]").
-        iMod "Hcont". iModIntro. wp_auto. wp_apply (wp_wand with "Hcont") as (?) "HΦ". iApply "Hwand". iFrame.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]"). iMod "Hcont". iModIntro.
-        iMod "Hcont". iModIntro. iNext. iNamed "Hcont". iFrame.
-        destruct s; try iFrame. iIntros "H". iSpecialize ("Hcontinner" with "[$]").
-        iMod "Hcontinner". iModIntro. wp_auto. wp_apply (wp_wand with "Hcontinner") as (v) "HΦ". iApply "Hwand". iFrame.
-      * iFrame.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]"). iMod "Hcont". iModIntro.
+      rewrite /send_au. repeat iSplit.
+      * (* send_fast_path_au *)
+        iLeft in "Hau". iIntros "[Hlc Hoc]".
+        iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
         wp_auto. wp_apply (wp_wand with "Hcont"). iIntros (v) "HΦ".
         wp_auto. iApply "Hwand". iFrame.
-      * iFrame.
-      * iFrame.
-      * iFrame.
+      * (* send_slow_path_au *)
+        iRight in "Hau". iLeft in "Hau".
+        iIntros "[Hlc Hoc]".
+        iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hau]". iModIntro.
+        iIntros "[Hlc Hoc]".
+        iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_apply (wp_wand with "Hcont") as (v) "HΦ". iApply "Hwand". iFrame.
+      * (* send_enq_au *)
+        iRight in "Hau". iRight in "Hau". iLeft in "Hau".
+        iIntros (buf) "(Hlc & %Hlt & Hoc)".
+        iMod ("Hau" $! buf with "[$Hlc $Hoc]") as "[$ Hcont]"; first (iPureIntro; lia).
+        iModIntro. wp_auto.
+        wp_apply (wp_wand with "Hcont") as (?) "HΦ". iApply "Hwand". iFrame.
+      * (* send_closed_au *)
+        iRight in "Hau". iRight in "Hau". iRight in "Hau". iFrame.
     + wp_auto. iRight in "HΦ". done.
   - iIntros (Φ) "HΦ Hwand".
     wp_call.
@@ -186,55 +236,44 @@ Proof.
     wp_apply (wp_TryReceive with "[$]").
     iSplit.
     + iLeft in "HΦ". iDestruct "HΦ" as "(_ & _ & Hau)".
-      iMod "Hau". iModIntro. iNext.
-      iNamed "Hau". iFrame. destruct s.
-      * destruct buff.
-        -- iFrame.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]"). iMod "Hcont". iModIntro.
-        iMod "Hcont". iModIntro. iNext. iNamed "Hcont". iFrame.
-        destruct s; try iFrame.
-        -- iIntros "H". iSpecialize ("Hcontinner" with "[$]").
-           iMod "Hcontinner". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcontinner"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-        -- destruct drain; try iFrame.
-           iIntros "H". iSpecialize ("Hcontinner" with "[$]").
-           iMod "Hcontinner". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcontinner"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]").
-        iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
+      rewrite /recv_au. repeat iSplit.
+      * (* recv_fast_path_au *)
+        iLeft in "Hau". iIntros (w) "[Hlc Hoc]".
+        iMod ("Hau" $! w with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_bind (body _).
         iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-      * iFrame.
-      * iFrame.
-      * iFrame.
-      * destruct drain.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
+      * (* recv_slow_path_au *)
+        iRight in "Hau". iLeft in "Hau".
+        iIntros "[Hlc Hoc]".
+        iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hau]". iModIntro.
+        iIntros (w) "[Hlc Hoc]".
+        iMod ("Hau" $! w with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_bind (body _).
+        iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
+      * (* recv_deq_au *)
+        iRight in "Hau". iRight in "Hau". iLeft in "Hau".
+        iIntros (w rest) "[Hlc Hoc]".
+        iMod ("Hau" $! w rest with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_bind (body _).
+        iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
+      * (* recv_drain_au *)
+        iRight in "Hau". iRight in "Hau". iRight in "Hau". iLeft in "Hau".
+        iIntros (w rest) "[Hlc Hoc]".
+        iMod ("Hau" $! w rest with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_bind (body _).
+        iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
+      * (* recv_closed_au *)
+        iRight in "Hau". iRight in "Hau". iRight in "Hau". iRight in "Hau".
+        iIntros "[Hlc Hoc]".
+        iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+        wp_auto. wp_bind (body _).
+        iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
     + wp_auto. iRight in "HΦ". iFrame.
 Qed.
 
 Local Lemma wp_try_select_blocking (clauses : list comm_clause) :
   ∀ Ψ Φ,
-  ([∧ list] c ∈ clauses,
-     (match c with
-      | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-          ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-        is_chan send_chan γ V ∗
-        send_au γ v (WP send_handler {{ Ψ }})
-     | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-         ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-        is_chan recv_chan γ V ∗
-        recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }})
-      end
-  )) ∧ (Φ (#(), #false)%V) -∗
+  ([∧ list] c ∈ clauses, select_clause_blocking Ψ c) ∧ (Φ (#(), #false)%V) -∗
   □(∀ retv, Ψ retv -∗ Φ (retv, #true)%V) -∗
   WP chan.try_select true clauses {{ Φ }}.
 Proof.
@@ -271,20 +310,7 @@ Qed.
 
 Lemma wp_select_blocking (clauses : list comm_clause) :
   ∀ Φ,
-  ([∧ list] c ∈ clauses,
-     (match c with
-      | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-          ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-        is_chan send_chan γ V ∗
-        send_au γ v (WP send_handler {{ Φ }})
-     | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-         ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-        is_chan recv_chan γ V ∗
-        recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Φ }})
-      end
-     )) -∗
+  ([∧ list] c ∈ clauses, select_clause_blocking Φ c) -∗
   WP SelectStmt (SelectStmtClausesV None clauses) {{ Φ }}.
 Proof.
   iIntros (Φ) "Hcases".
@@ -298,114 +324,17 @@ Proof.
   - iModIntro. iIntros "% HΦ". wp_auto. iFrame.
 Qed.
 
-Local Lemma wp_try_comm_clause_nonblocking c Ψ :
-  ∀ Φ,
-  (match c with
-   | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-       ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-     is_chan send_chan γ V ∗
-     nonblocking_send_au γ v (WP send_handler {{ Ψ }}) True
-   | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-       ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-     is_chan recv_chan γ V ∗
-     nonblocking_recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }}) True
-   end
-  ) ∧ (Φ (#(), #false)%V) -∗
-  (∀ retv, Ψ retv -∗ Φ (retv, #true)%V) -∗
-  WP chan.try_comm_clause c #false {{ Φ }}.
+(** Pull persistent content out from under an [∧] without spending the [∧]:
+    needed to read a clause's witnesses out of the plain select precondition
+    while still having it available for the not-ready payload. *)
+Local Lemma and_sep_persistent (R Q P : iProp Σ) `{!Persistent R} :
+  (R ∗ Q) ∧ P ⊢ R ∗ (Q ∧ P).
 Proof.
-  destruct c as [[|]]; simpl.
-  - iIntros (Φ) "HΦ Hwand".
-    wp_call.
-    repeat setoid_rewrite bi.and_exist_r.
-    iDestruct "HΦ" as (V send_chan γ v' ? ? ?) "HΦ".
-    iAssert (⌜ e = #v' ∧ ch = #send_chan ⌝ ∗ is_chan send_chan γ V)%I with "[-]" as "[[-> ->] #?]".
-    { iLeft in "HΦ". iDestruct "HΦ" as "(% & ? & _)". iFrame "∗%". }
-    simpl. wp_auto.
-    wp_apply (wp_TrySend with "[$]").
-    iLeft. iSplit.
-    + iLeft in "HΦ". iDestruct "HΦ" as "(_ & _ & Hau)".
-      iLeft in "Hau". iMod "Hau". iModIntro. iNext. iNamed "Hau".
-      iFrame. destruct s.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]").
-        iMod "Hcont". iModIntro. wp_auto. wp_apply (wp_wand with "Hcont") as (?) "HΦ". iApply "Hwand". iFrame.
-      * done.
-      * done.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]"). iMod "Hcont". iModIntro.
-        wp_auto. wp_apply (wp_wand with "Hcont"). iIntros "% HΨ". wp_auto.
-        iApply "Hwand". done.
-      * done.
-      * done.
-      * done.
-    + wp_auto. iRight in "HΦ". done.
-  - iIntros (Φ) "HΦ Hwand".
-    wp_call.
-    repeat setoid_rewrite bi.and_exist_r.
-    iDestruct "HΦ" as (V recv_chan γ ? ? ?) "HΦ".
-    iAssert (⌜ ch = #recv_chan ⌝ ∗ is_chan recv_chan γ V)%I with "[-]" as "#[-> ?]".
-    { iLeft in "HΦ". iDestruct "HΦ" as "(% & ? & _)". iFrame "∗%". }
-    simpl. wp_auto.
-    wp_apply (wp_TryReceive with "[$]").
-    iLeft. iSplit.
-    + iLeft in "HΦ". iDestruct "HΦ" as "(_ & _ & Hau)".
-      iLeft in "Hau". iMod "Hau". iModIntro. iNext.
-      iNamed "Hau". iFrame. destruct s.
-      * destruct buff.
-        -- iFrame.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-      * done.
-      * iIntros "H". iSpecialize ("Hcont" with "[$]").
-        iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-        iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-      * done.
-      * done.
-      * done.
-      * destruct drain.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-        -- iIntros "H". iSpecialize ("Hcont" with "[$]").
-           iMod "Hcont". iModIntro. wp_auto. wp_bind (body _).
-           iApply (wp_wand with "Hcont"). iIntros (?) "HΦ". wp_auto. iApply "Hwand". iFrame.
-    + wp_auto. iRight in "HΦ". iFrame.
-Qed.
-
-Local Lemma wp_try_select_nonblocking (clauses : list comm_clause) :
-  ∀ Ψ Φ,
-  ([∧ list] c ∈ clauses ,
-     (match c with
-      | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-          ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-        is_chan send_chan γ V ∗
-        nonblocking_send_au γ v (WP send_handler {{ Ψ }}) True
-      | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-          ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-        is_chan recv_chan γ V ∗
-        nonblocking_recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }}) True
-      end
-  )) ∧ Φ (#(), #false)%V -∗
-  □(∀ retv, Ψ retv -∗ Φ (retv, #true)%V) -∗
-  WP chan.try_select false clauses {{ Φ }}.
-Proof.
-  simpl. iIntros (Ψ Φ) "HΦ #Hwand".
-  iLöb as "IH" forall (clauses).
-  destruct clauses.
-  { wp_auto. iRight in "HΦ". iApply "HΦ". }
-  simpl.
-  wp_apply (wp_try_comm_clause_nonblocking _ Ψ with "[-Hwand] [Hwand]").
-  2:{ iIntros (?) "HΨ". wp_auto. iApply "Hwand". iFrame. }
-  iSplit.
-  { simpl. iLeft in "HΦ". iLeft in "HΦ". iFrame. }
-  wp_auto. wp_apply ("IH" with "[HΦ]"); try iFrame.
-  iSplit.
-  - iLeft in "HΦ". simpl. iRight in "HΦ". iFrame.
-  - iRight in "HΦ". done.
+  iIntros "H". iApply bi.persistent_and_sep_1. iSplit.
+  - iDestruct "H" as "[[$ _] _]".
+  - iSplit.
+    + iDestruct "H" as "[[_ $] _]".
+    + iDestruct "H" as "[_ $]".
 Qed.
 
 Local Lemma wp_SelectStmt_nonblocking {stk E} (def : expr) clauses Φ :
@@ -424,52 +353,9 @@ Proof.
   destruct Hstep as [[? []]]. subst. iIntros "_ $ !>". simpl. wp_pures. by iApply "HΦ".
 Qed.
 
-Lemma wp_select_nonblocking (clauses : list comm_clause) def :
-  ∀ Φ,
-  ([∧ list] c ∈ clauses,
-     (match c with
-      | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-          ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-        is_chan send_chan γ V ∗
-        nonblocking_send_au γ v (WP send_handler {{ Φ }}) True
-      | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-          ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-        ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-        is_chan recv_chan γ V ∗
-        nonblocking_recv_au γ V (λ v ok, WP recv_handler (#v, #ok)%V {{ Φ }}) True
-      end
-  )) ∧ WP def {{ Φ }} -∗
-  WP SelectStmt (SelectStmtClausesV (Some def) clauses) {{ Φ }}.
-Proof.
-  iIntros (Φ) "Hcases".
-  iLöb as "IH" forall (Φ).
-  wp_apply wp_SelectStmt_nonblocking.
-  iIntros (clauses') "%Hperm".
-  wp_apply (wp_try_select_nonblocking with "[-]").
-  - rewrite Hperm.
-    iSplit.
-    + iLeft in "Hcases". iFrame.
-    + iRight in "Hcases". wp_auto. iFrame.
-  - iModIntro. iIntros "% HΦ". wp_auto. iFrame.
-Qed.
-
 Local Lemma wp_try_select_case_nonblocking_alt c Ψ Ψnotready :
   ∀ Φ,
-  (match c with
-   | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-       ∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-     is_chan send_chan γ V ∗
-     nonblocking_send_au_alt γ v (WP send_handler {{ Ψ }}) Ψnotready
-  | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-      ∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-     ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-     is_chan recv_chan γ V ∗
-     nonblocking_recv_au_alt γ V
-       (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }}) Ψnotready
-   end
-  ) -∗
+  select_clause_nonblocking_alt Ψ Ψnotready c -∗
   ((∀ retv, Ψ retv -∗ Φ (retv, #true)%V) ∧ (Ψnotready -∗ Φ (#(), #false)%V)) -∗
   WP chan.try_comm_clause c #false {{ Φ }}.
 Proof.
@@ -479,76 +365,64 @@ Proof.
     iNamed "HΦ". iDestruct "HΦ" as "([-> ->] & #? & Hau)". simpl. wp_auto.
     wp_apply (wp_TrySend with "[$]").
     iRight.
-    iMod "Hau". iModIntro. iNext. iNamed "Hau".
-    iFrame. destruct s.
-    + destruct decide.
-      * iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
-        wp_apply (wp_wand with "Hcont"). iIntros (?) "HΨ".
-        iLeft in "Hwand". wp_auto. iApply "Hwand". iFrame.
-      * iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
-        iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
-      iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
-      iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
+    rewrite {2}/nonblocking_send_au_alt. repeat iSplit.
+    + (* send_fast_path_au *)
+      iLeft in "Hau". iIntros "[Hlc Hoc]".
+      iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro. wp_auto.
       wp_apply (wp_wand with "Hcont"). iIntros (?) "HΨ".
       iLeft in "Hwand". wp_auto. iApply "Hwand". iFrame.
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
+    + (* send_enq_au *)
+      iRight in "Hau". iLeft in "Hau". iIntros (buf) "(Hlc & %Hlt & Hoc)".
+      iMod ("Hau" $! buf with "[$Hlc $Hoc]") as "[$ Hcont]"; first (iPureIntro; lia).
+      iModIntro. wp_auto.
+      wp_apply (wp_wand with "Hcont"). iIntros (?) "HΨ".
+      iLeft in "Hwand". wp_auto. iApply "Hwand". iFrame.
+    + (* send_closed_au *)
+      iRight in "Hau". iRight in "Hau". iLeft in "Hau". iFrame.
+    + (* send_not_ready_au *)
+      iRight in "Hau". iRight in "Hau". iRight in "Hau".
+      iIntros (s) "(Hlc & %Hnr & Hoc)".
+      iMod ("Hau" $! s with "[$Hlc $Hoc]") as "[$ Hnr]"; first (iPureIntro; done).
+      iModIntro. wp_auto.
       iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro. wp_auto.
-      iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + done.
   - iIntros (Φ) "HΦ Hwand".
     wp_call.
     iNamed "HΦ". iDestruct "HΦ" as "(-> & #? & Hau)". simpl. wp_auto.
     wp_apply (wp_TryReceive with "[$]").
     iRight.
-    iMod "Hau". iModIntro. iNext.
-    iNamed "Hau". iFrame. destruct s.
-    + destruct buff.
-      * iIntros "H". iMod ("Hcont" with "[$]"). iModIntro.
-        wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
-      * iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro.
-        wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
-        iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
-    + iIntros "H". iMod ("Hcont" with "[$]"). iModIntro.
-      wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro.
+    rewrite {2}/nonblocking_recv_au_alt. repeat iSplit.
+    + (* recv_fast_path_au *)
+      iLeft in "Hau". iIntros (w) "[Hlc Hoc]".
+      iMod ("Hau" $! w with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
       wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
       iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
-    + iIntros "H". iMod ("Hcont" with "[$]"). iModIntro.
-      wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]"). iModIntro.
-      wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + iIntros "H". iMod ("Hcont" with "[$]"). iModIntro.
-      wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
-    + destruct drain.
-      * iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro.
-        wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
-        iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
-      * iIntros "H". iMod ("Hcont" with "[$]") as "Hcont". iModIntro.
-        wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
-        iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
+    + (* recv_deq_au *)
+      iRight in "Hau". iLeft in "Hau". iIntros (w rest) "[Hlc Hoc]".
+      iMod ("Hau" $! w rest with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+      wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
+      iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
+    + (* recv_drain_au *)
+      iRight in "Hau". iRight in "Hau". iLeft in "Hau". iIntros (w rest) "[Hlc Hoc]".
+      iMod ("Hau" $! w rest with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+      wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
+      iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
+    + (* recv_closed_au *)
+      iRight in "Hau". iRight in "Hau". iRight in "Hau". iLeft in "Hau".
+      iIntros "[Hlc Hoc]".
+      iMod ("Hau" with "[$Hlc $Hoc]") as "[$ Hcont]". iModIntro.
+      wp_auto. wp_bind (body _). iApply (wp_wand with "Hcont").
+      iIntros (?) "HΦ". wp_auto. by iApply "Hwand".
+    + (* recv_not_ready_au *)
+      iRight in "Hau". iRight in "Hau". iRight in "Hau". iRight in "Hau".
+      iIntros (s) "(Hlc & %Hnr & Hoc)".
+      iMod ("Hau" $! s with "[$Hlc $Hoc]") as "[$ Hnr]"; first (iPureIntro; done).
+      iModIntro. wp_auto. iRight in "Hwand". iApply ("Hwand" with "[$]").
 Qed.
 
 Local Lemma wp_try_select_nonblocking_alt Φnrs (clauses : list comm_clause) :
   ∀ P Ψ Φ,
   ([∗ list] c; Φnr ∈ clauses; Φnrs,
-     P -∗
-     match c with
-     | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-         (∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-             ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-             is_chan send_chan γ V ∗
-             nonblocking_send_au_alt γ v (WP send_handler {{ Ψ }}) (P ∗ Φnr))
-      | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-          (∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-              ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-              is_chan recv_chan γ V ∗
-              nonblocking_recv_au_alt γ V
-                (λ v ok, WP recv_handler (#v, #ok)%V {{ Ψ }}) (P ∗ Φnr))
-     end) -∗
+     P -∗ select_clause_nonblocking_alt Ψ (P ∗ Φnr) c) -∗
   P -∗
   (P -∗ [∗] Φnrs -∗ (Φ (#(), #false)%V)) -∗
   □(∀ retv, Ψ retv -∗ Φ (retv, #true)%V) -∗
@@ -584,20 +458,7 @@ Qed.
 Lemma wp_select_nonblocking_alt Φnrs P (clauses : list comm_clause) (def : expr) :
   ∀ Φ,
   ([∗ list] c; Φnr ∈ clauses; Φnrs,
-     P -∗
-     match c with
-     | CommClause (SendCase t send_chan_expr send_val) send_handler =>
-         (∃ V send_chan γ (v : V) `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-             ⌜ send_val = #v ∧ send_chan_expr = #send_chan ⌝ ∗
-             is_chan send_chan γ V ∗
-             nonblocking_send_au_alt γ v (WP send_handler {{ Φ }}) (P ∗ Φnr))
-      | CommClause (RecvCase t recv_chan_expr) recv_handler =>
-          (∃ V recv_chan γ `(!ZeroVal V) `(!TypedPointsto V) `(!IntoValTyped V t),
-              ⌜ recv_chan_expr = #recv_chan ⌝ ∗
-              is_chan recv_chan γ V ∗
-              nonblocking_recv_au_alt γ V
-                (λ v ok, WP recv_handler (#v, #ok)%V {{ Φ }}) (P ∗ Φnr))
-     end) -∗
+     P -∗ select_clause_nonblocking_alt Φ (P ∗ Φnr) c) -∗
   P -∗
   (P -∗ [∗] Φnrs -∗ WP def {{ Φ }}) -∗
   WP SelectStmt (SelectStmtClausesV (Some def) clauses) {{ Φ }}.
@@ -617,6 +478,54 @@ Proof.
   - iIntros "HP Hnrs". wp_auto. iApply ("Hdef" with "[$] [$]").
   - iModIntro. iIntros. wp_auto. iFrame.
 Qed.
+
+(** The plain nonblocking select spec is a corollary of the [Alt] one: take the
+    private precondition [P] to be the whole plain precondition and every [Φnr]
+    to be [True].  Callers never see [P]. *)
+Lemma wp_select_nonblocking (clauses : list comm_clause) def :
+  ∀ Φ,
+  ([∧ list] c ∈ clauses, select_clause_nonblocking Φ c) ∧ WP def {{ Φ }} -∗
+  WP SelectStmt (SelectStmtClausesV (Some def) clauses) {{ Φ }}.
+Proof.
+  iIntros (Φ) "Hcases".
+  set (P := (([∧ list] c ∈ clauses, select_clause_nonblocking Φ c) ∧ WP def {{ Φ }})%I).
+  iApply (wp_select_nonblocking_alt (replicate (length clauses) True%I) P clauses def
+           with "[] Hcases []").
+  - iApply big_sepL2_intro; first by rewrite length_replicate.
+    iIntros "!>" (k c Φnr Hc HΦnr) "HP".
+    apply lookup_replicate in HΦnr as [-> _].
+    iAssert (select_clause_nonblocking Φ c ∧ P)%I with "[HP]" as "H".
+    { iSplit; [ iLeft in "HP"; by iApply (big_andL_lookup _ _ _ _ Hc) | iFrame ]. }
+    destruct c as [[|] ?]; simpl.
+    + repeat setoid_rewrite bi.and_exist_r.
+      iDestruct "H" as (V sch g v ???) "H".
+      iDestruct (and_sep_persistent with "H") as "[%Heq H]".
+      iDestruct (and_sep_persistent with "H") as "[#Hch H]".
+      iExists V, sch, g, v, _, _, _.
+      iSplitR; [ iPureIntro; exact Heq | ]. iFrame "Hch".
+      iApply (nonblocking_send_au_to_alt sch).
+      rewrite /nonblocking_send_au. iSplit; [| iSplit; [| iSplit ] ].
+      * iLeft in "H". iLeft in "H". iFrame; try done.
+      * iLeft in "H". iRight in "H". iLeft in "H". iFrame; try done.
+      * iLeft in "H". iRight in "H". iRight in "H". iLeft in "H". iFrame; try done.
+      * iRight in "H". iSplitL "H"; [ iExact "H" | done ].
+    + repeat setoid_rewrite bi.and_exist_r.
+      iDestruct "H" as (V rch g ???) "H".
+      iDestruct (and_sep_persistent with "H") as "[%Heq H]".
+      iDestruct (and_sep_persistent with "H") as "[#Hch H]".
+      iExists V, rch, g, _, _, _.
+      iSplitR; [ iPureIntro; exact Heq | ]. iFrame "Hch".
+      iApply (nonblocking_recv_au_to_alt rch).
+      rewrite /nonblocking_recv_au. iSplit; [| iSplit; [| iSplit; [| iSplit ] ] ].
+      * iLeft in "H". iLeft in "H". iFrame; try done.
+      * iLeft in "H". iRight in "H". iLeft in "H". iFrame; try done.
+      * iLeft in "H". iRight in "H". iRight in "H". iLeft in "H". iFrame; try done.
+      * iLeft in "H". iRight in "H". iRight in "H". iRight in "H". iLeft in "H". iFrame; try done.
+      * iRight in "H". iSplitL "H"; [ iExact "H" | done ].
+  - iIntros "HP _". iRight in "HP". iFrame.
+Qed.
+
+
 
 End select_proof.
 

@@ -171,16 +171,16 @@ Local Definition own_exchanger_inv γ N exstate : iProp Σ :=
       match exstate with
       | chanstate.Idle =>
           "Hs◯" ∷ ½s γs ∗ "Hr◯" ∷ ½r γr
-      | chanstate.SndPending v =>
+      | chanstate.SndWait v =>
           "Hpush_au" ∷ (|={⊤∖↑N,∅}=> ∃ σ, ⟦σ⟧ ∗ (⟦v :: σ⟧ ={∅,⊤∖↑N}=∗ token γs)) ∗
           "Hr◯" ∷ ½r γr
-      | chanstate.RcvPending =>
+      | chanstate.RcvWait =>
           "Hpop_au" ∷ (|={⊤∖↑N,∅}=> ∃ σ, ⟦σ⟧ ∗ (∀ v σ', ⌜ σ = v :: σ' ⌝ → ⟦σ'⟧ ={∅,⊤∖↑N}=∗
                                                         ghost_var γr (3/4) v)) ∗
           "Hs◯" ∷ ½s γs
-      | chanstate.SndCommit v =>
+      | chanstate.SndDone v =>
           "Hpop_wit" ∷ ghost_var γr (3/4) v ∗ "Hs◯" ∷ ½s γs
-      | chanstate.RcvCommit =>
+      | chanstate.RcvDone =>
           "Hpush_wit" ∷ token γs ∗ "Hr◯" ∷ ½r γr
       | _ => False
       end
@@ -262,6 +262,13 @@ Qed.
 (* FIXME *)
 Transparent bag.is_chan_bag.
 
+(* Open the elimination-stack invariant and hand the arm the invariant's half
+   of [own_chan].  The suffixed names feed [iCombineNamed "*_inv"] on close. *)
+Local Ltac es_open :=
+  iInv "Hinv" as "Hi" "Hclose";
+  iMod (lc_fupd_elim_later with "Hlc Hi") as "Hi";
+  iNamedSuffix "Hi" "_inv".
+
 Lemma wp_EliminationStack__Push v γ s N :
   ∀ Φ,
   is_pkg_init elimination_stack ∗ is_EliminationStack s γ N -∗
@@ -276,14 +283,39 @@ Proof.
   simpl. iSplit.
   - (* elimination occurs *)
     repeat iExists _; iSplitR; first done. iFrame "#".
-    iInv "Hinv" as "Hi" "Hclose".
-    iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-    iNamedSuffix "Hi" "_inv". iApply fupd_mask_intro; first solve_ndisj.
-    iIntros "Hmask". iNext. iFrame.
-    destruct exstate; iNamedSuffix "Hexchanger_inv" "_inv"; try by iExFalso.
-    + (* idle *)
-      iNamedSuffix "Hexchanger_inv" "_inv";
-      iIntros "exchanger_inv". iMod "Hmask" as "_".
+    rewrite /send_au. repeat iSplit.
+    + (* send_fast_path_au : a popper is parked, so complete the exchange here *)
+      iIntros "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (chanstate.SndDone v)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap |- *; lia | ].
+      iMod (fupd_mask_subseteq _) as "Hmask"; last iMod "HΦ" as "(% & Hfrag & HΦ)"; first solve_ndisj.
+      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst stack.
+      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
+      { compute_done. }
+      iMod ("HΦ" with "Hfrag") as "HΦ". iMod "Hmask" as "_".
+      iMod "Hpop_au_inv" as "(% & Hfrag & Hpop)".
+      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst σ0.
+      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
+      { compute_done. }
+      iMod ("Hpop" with "[//] Hfrag") as "Hpop_inv".
+      iCombineNamed "*_inv" as "Hi".
+      iMod ("Hclose" with "[Hi]") as "_".
+      { iNamed "Hi". iFrame. iFrame. }
+      iModIntro. iFrame "H2". wp_auto. iFrame.
+    + (* send_slow_path_au : nobody is here, so park the offer *)
+      iIntros "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (chanstate.SndWait v)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap |- *; lia | ].
       iRename "Hs◯_inv" into "Hs◯".
       rename γs into γs_old.
       iRename "HΦ" into "Hau_inv".
@@ -301,13 +333,15 @@ Proof.
         iMod (fupd_mask_subseteq _) as "Hmask";
           last iMod ("Htok_inv" with "[$]") as "Htok"; first solve_ndisj.
         iMod "Hmask". iFrame. done. }
-      iModIntro.
-      iInv "Hinv" as "Hi" "Hclose".
-      iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-      iNamedSuffix "Hi" "_inv". iApply fupd_mask_intro; first solve_ndisj.
-      iIntros "Hmask". iNext. iFrame.
-      destruct exstate; iNamedSuffix "Hexchanger_inv" "_inv"; try by done.
-      iIntros "exchanger_inv". iMod "Hmask" as "_".
+      iModIntro. iFrame "H2".
+      (* phase two: the popper committed, collect the escrowed continuation *)
+      iIntros "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap2.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (@chanstate.Idle go_string)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap2 |- *; lia | ].
       iCombine "Hs●_inv Hs◯" gives %[_ ->]. iRename "Hs◯" into "Hs◯_inv".
       iNamed "Hexchanger_inv". iRename "Hr◯" into "Hr◯_inv".
       iCombineNamed "*_inv" as "Hi".
@@ -315,29 +349,19 @@ Proof.
       { iNamed "Hi". iFrame. iFrame. }
       iMod (fupd_mask_subseteq _) as "Hmask"; last iMod ("HΦ" with "[$]") as "HΦ";
         first solve_ndisj.
-      iMod "Hmask" as "_". iModIntro. wp_auto. iFrame.
-    + done.
-    + iIntros "exchanger_inv". iMod "Hmask" as "_". iNamedSuffix "Hexchanger_inv" "_inv".
-      iMod (fupd_mask_subseteq _) as "Hmask"; last iMod "HΦ" as "(% & Hfrag & HΦ)"; first solve_ndisj.
-      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst stack.
-      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
-      { compute_done. }
-      iMod ("HΦ" with "Hfrag") as "HΦ". iMod "Hmask" as "_".
-      iMod "Hpop_au_inv" as "(% & Hfrag & Hpop)".
-      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst σ0.
-      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
-      { compute_done. }
-      iMod ("Hpop" with "[//] Hfrag") as "Hpop_inv".
-      iCombineNamed "*_inv" as "Hi".
-      iMod ("Hclose" with "[Hi]") as "_".
-      { iNamed "Hi". iFrame. iFrame. }
-      iModIntro. wp_auto. iFrame.
-    + done.
-    + done.
+      iMod "Hmask" as "_". iModIntro. iFrame "H2". wp_auto. iFrame.
+    + (* send_enq_au : the exchanger is unbuffered *)
+      iIntros (buf) "(Hlc & %Hlt & Himpl)". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iNamedSuffix "Hexchanger_inv" "_inv". iDestruct "Hexchanger_inv" as "[]".
+    + (* send_closed_au : the exchanger is never closed *)
+      iIntros (drain) "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iNamedSuffix "Hexchanger_inv" "_inv". iDestruct "Hexchanger_inv" as "[]".
   - iSplit; last done.
     repeat iExists _; iSplitR; first done. iFrame "#".
     iPoseProof "Hafter" as "[$ _]".
-    iApply (bag.bag_recv_au with "[$] [$Hafter]").
+    iApply (bag.bag_recv_au with "[$Hafter]").
     iIntros (t) "_ !>". wp_auto_lc 1.
     wp_apply wp_LockedStack__Push.
     { iFrame "#". }
@@ -376,14 +400,39 @@ Proof.
   simpl. iSplit.
   - (* elimination occurs *)
     repeat iExists _; iSplitR; first done. iFrame "#".
-    iInv "Hinv" as "Hi" "Hclose".
-    iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-    iNamedSuffix "Hi" "_inv". iApply fupd_mask_intro; first solve_ndisj.
-    iIntros "Hmask". iNext. iFrame.
-    destruct exstate; iNamedSuffix "Hexchanger_inv" "_inv"; try by iExFalso.
-    + (* idle *)
-      iNamedSuffix "Hexchanger_inv" "_inv";
-      iIntros "exchanger_inv". iMod "Hmask" as "_".
+    rewrite /recv_au. repeat iSplit.
+    + (* recv_fast_path_au : a pusher is parked, so complete the exchange here *)
+      iIntros (w) "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (@chanstate.RcvDone go_string)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap |- *; lia | ].
+      iMod "Hpush_au_inv" as "(% & Hfrag & Hpush)".
+      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst.
+      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
+      { compute_done. }
+      iMod ("Hpush" with "Hfrag") as "Hpush_inv".
+      iMod (fupd_mask_subseteq _) as "Hmask"; last iMod "HΦ" as "(% & Hfrag & HΦ)"; first solve_ndisj.
+      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst.
+      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
+      { compute_done. }
+      iMod ("HΦ" with "Hfrag") as "HΦ". iMod "Hmask".
+      iCombineNamed "*_inv" as "Hi".
+      iMod ("Hclose" with "[Hi]") as "_".
+      { iNamed "Hi". iFrame. iFrame. }
+      iModIntro. iFrame "H2". wp_auto. iFrame.
+    + (* recv_slow_path_au : nobody is here, so park *)
+      iIntros "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (@chanstate.RcvWait go_string)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap |- *; lia | ].
       iRename "Hr◯_inv" into "Hr◯".
       rename γs into γs_old.
       iRename "HΦ" into "Hau_inv".
@@ -401,13 +450,15 @@ Proof.
         iMod (fupd_mask_subseteq _) as "Hmask";
           last iMod ("Htok_inv" with "[$]") as "Htok"; first solve_ndisj.
         iMod "Hmask". iFrame. done. }
-      iModIntro.
-      iInv "Hinv" as "Hi" "Hclose".
-      iMod (lc_fupd_elim_later with "[$] Hi") as "Hi".
-      iNamedSuffix "Hi" "_inv". iApply fupd_mask_intro; first solve_ndisj.
-      iIntros "Hmask". iNext. iFrame.
-      destruct exstate; iNamedSuffix "Hexchanger_inv" "_inv"; try by done.
-      iIntros "exchanger_inv". iMod "Hmask" as "_".
+      iModIntro. iFrame "H2".
+      (* phase two: the pusher committed, collect the escrowed continuation *)
+      iIntros (w) "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iDestruct (own_chan_cap_valid with "Himpl") as %Hcap2.
+      iNamedSuffix "Hexchanger_inv" "_inv".
+      iMod (own_chan_halves_update (@chanstate.Idle go_string)
+             with "exchanger_inv Himpl") as "[exchanger_inv H2]";
+        [ simpl in Hcap2 |- *; lia | ].
       iCombine "Hr●_inv Hr◯" gives %[_ ->]. iRename "Hr◯" into "Hr◯_inv".
       iNamed "Hexchanger_inv". iRename "Hs◯" into "Hs◯_inv".
       iCombineNamed "*_inv" as "Hi".
@@ -415,30 +466,24 @@ Proof.
       { iNamed "Hi". iFrame. iFrame. }
       iMod (fupd_mask_subseteq _) as "Hmask"; last iMod ("HΦ" with "[$]") as "HΦ";
         first solve_ndisj.
-      iMod "Hmask" as "_". iModIntro. wp_auto. iFrame.
-    + iIntros "exchanger_inv". iMod "Hmask" as "_". iNamedSuffix "Hexchanger_inv" "_inv".
-      iMod "Hpush_au_inv" as "(% & Hfrag & Hpush)".
-      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst.
-      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
-      { compute_done. }
-      iMod ("Hpush" with "Hfrag") as "Hpush_inv".
-      iMod (fupd_mask_subseteq _) as "Hmask"; last iMod "HΦ" as "(% & Hfrag & HΦ)"; first solve_ndisj.
-      iCombine "Hfrag Hauth_inv" gives %[_ Heq]. subst.
-      iMod (ghost_var_update_2 with "Hfrag Hauth_inv") as "[Hfrag Hauth_inv]".
-      { compute_done. }
-      iMod ("HΦ" with "Hfrag") as "HΦ". iMod "Hmask".
-      iCombineNamed "*_inv" as "Hi".
-      iMod ("Hclose" with "[Hi]") as "_".
-      { iNamed "Hi". iFrame. iFrame. }
-      iModIntro. wp_auto. iFrame.
-    + done.
-    + done.
-    + done.
+      iMod "Hmask" as "_". iModIntro. iFrame "H2". wp_auto. iFrame.
+    + (* recv_deq_au : the exchanger is unbuffered *)
+      iIntros (w rest) "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iNamedSuffix "Hexchanger_inv" "_inv". iDestruct "Hexchanger_inv" as "[]".
+    + (* recv_drain_au : the exchanger is never closed *)
+      iIntros (w rest) "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iNamedSuffix "Hexchanger_inv" "_inv". iDestruct "Hexchanger_inv" as "[]".
+    + (* recv_closed_au : the exchanger is never closed *)
+      iIntros "[Hlc Himpl]". es_open.
+      iDestruct (own_chan_agree with "exchanger_inv Himpl") as %->.
+      iNamedSuffix "Hexchanger_inv" "_inv". iDestruct "Hexchanger_inv" as "[]".
   - iSplitL; last done.
     repeat iExists _; iSplitR; first done. iFrame "#".
     (* FIXME: need to break is_chan_bag to get is_chan *)
     iPoseProof "Hafter" as "[$ _]".
-    iApply (bag.bag_recv_au with "[$] [$Hafter]").
+    iApply (bag.bag_recv_au with "[$Hafter]").
     iIntros (t) "_ !>". wp_auto_lc 1.
     wp_apply wp_LockedStack__Pop.
     { iFrame "#". }

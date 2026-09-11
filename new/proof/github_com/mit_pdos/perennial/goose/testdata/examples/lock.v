@@ -84,7 +84,7 @@ Proof.
   iSplit.
   - simpl. iFrame "#". iExists _, _ .
     iSplitR; first done.
-    iApply ((lock_channel_nonblocking_send_au(t:=go.StructType [])) with "[$Hchan $Hinv] [$]").
+    iApply ((lock_channel_nonblocking_send_au(t:=go.StructType [])) with "[$Hchan $Hinv]").
     iIntros "Hl". wp_auto.
     iApply "HΦ". iFrame.
   - wp_auto.
@@ -105,7 +105,7 @@ Proof.
    iSplit.
   - simpl. iExists unit, l.(Lock.ch'), γ.(lchan_name), tt, _, _, _.
     iSplitR; first done. iFrame "#".
-    iApply (lock_channel_send_au (t:=go.StructType [])  with "[$Hchan $Hinv] [$]").
+    iApply (lock_channel_send_au (t:=go.StructType [])  with "[$Hchan $Hinv]").
     iNext. iIntros "HR".
     wp_auto. iApply "HΦ". iFrame.
   - iSplitL; last done.
@@ -115,7 +115,7 @@ Proof.
     iSplitR; first done.
     iDestruct (is_bag_is_chan with "Hafter_chan") as "#H".
     iFrame "#".
-    iApply (bag_recv_au with "[$] [$Hafter_chan]").
+    iApply (bag_recv_au with "Hafter_chan").
     iNext. iIntros (t). iIntros "Ht". wp_auto. iApply "HΦ". done.
 Qed.
 

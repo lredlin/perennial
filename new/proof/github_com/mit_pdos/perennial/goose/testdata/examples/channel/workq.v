@@ -391,7 +391,7 @@ Proof.
       repeat iExists _. iSplitR; first done. iFrame "#".
       iDestruct (is_bag_is_chan with "[]") as "$"; first iFrame "#".
       iApply blocking_rcv_implies_nonblocking.
-      iApply (bag_recv_au with "[$]").
+      iApply bag_recv_au.
       { iFrame "#". }
       iNext. iIntros "%v Hv". simpl subst.
       wp_auto. wp_apply (wp_Worker__process with "[Hv]").
@@ -404,7 +404,7 @@ Proof.
       repeat iExists _. iSplitR; first done. iFrame "#".
       iDestruct (is_bag_is_chan with "[]") as "$"; first iFrame "#".
       iApply blocking_rcv_implies_nonblocking.
-      iApply (bag_recv_au with "[$]").
+      iApply bag_recv_au.
       { iFrame "#". }
       iNext. iIntros "%reply_ch #Hreply_ch". simpl subst.
       wp_auto_lc 2.
@@ -415,7 +415,7 @@ Proof.
         repeat iExists _. iSplitR; first done. iFrame "#".
         iDestruct (is_bag_is_chan with "[]") as "$"; first iFrame "#".
         iApply blocking_rcv_implies_nonblocking.
-        iApply (bag_recv_au with "[$]").
+        iApply bag_recv_au.
         { iFrame "#". }
         iNext. iIntros "%v Hv".
         wp_auto_lc 2.
@@ -456,7 +456,7 @@ Proof.
       iNamedSuffix "Hcoord" "coord".
       repeat iExists _. iSplitR; first done. iFrame "#".
       iDestruct (is_bag_is_chan with "[]") as "$"; first iFrame "#".
-      iApply (bag_send_au with "[$]").
+      iApply bag_send_au.
       { iFrame "#". }
       { iFrame "#". }
       iNext. wp_auto.
@@ -473,7 +473,7 @@ Proof.
     { (* received local work while trying to steal. *)
       repeat iExists _. iSplitR; first done. iFrame "#".
       iDestruct (is_bag_is_chan with "[]") as "$"; first iFrame "#".
-      iApply (bag_recv_au with "[$]").
+      iApply bag_recv_au.
       { iFrame "#". }
       iNext. wp_auto. iIntros "%v Hv". simpl subst.
       wp_auto. wp_apply (wp_Worker__process with "[Hv]").
