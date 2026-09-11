@@ -18,7 +18,6 @@ From stdpp Require Export sets gmultiset countable.
     Requires Countable V because gmultiset V = gmap V positive.
 *)
 
-#[local] Transparent is_chan own_chan.
 
 Section mpmc.
 Context `{hG: heapGS Σ, !ffi_semantics _ _}.

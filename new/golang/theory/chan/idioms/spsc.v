@@ -16,7 +16,6 @@ From New.golang.theory.chan.idioms Require Export base.
     - Support for resource protocols P (per-value) and R (final state)
 *)
 
-#[local] Transparent is_chan own_chan.
 
 Section spsc.
 Context `{hG: heapGS Σ, !ffi_semantics _ _}.
