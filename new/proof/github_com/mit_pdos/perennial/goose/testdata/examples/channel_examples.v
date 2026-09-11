@@ -10,4 +10,6 @@ From New.proof.github_com.mit_pdos.perennial.goose.testdata.examples Require
   lock
   etcd_session
   workq
+  channel_mixtris
+  unbounded
   .
