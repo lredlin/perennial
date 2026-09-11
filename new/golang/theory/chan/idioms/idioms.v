@@ -7,3 +7,4 @@ From New.golang.theory.chan.idioms Require
   mpmc
   spsc.
 From New.golang.theory.chan.idioms.dsp Require dsp.
+From New.golang.theory.chan.idioms.mixtris Require mixtris.

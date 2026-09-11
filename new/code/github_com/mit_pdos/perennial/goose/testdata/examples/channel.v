@@ -86,6 +86,10 @@ Definition server {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := 
 
 Definition LeakyBufferPipeline {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := "github.com/mit-pdos/perennial/goose/testdata/examples/channel.LeakyBufferPipeline"%go.
 
+Definition ThreeWayElectionParty {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := "github.com/mit-pdos/perennial/goose/testdata/examples/channel.ThreeWayElectionParty"%go.
+
+Definition ThreeWayElection {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := "github.com/mit-pdos/perennial/goose/testdata/examples/channel.ThreeWayElection"%go.
+
 Definition mkStream {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := "github.com/mit-pdos/perennial/goose/testdata/examples/channel.mkStream"%go.
 
 Definition Async {ext : ffi_syntax} {go_gctx : GoGlobalContext} : go_string := "github.com/mit-pdos/perennial/goose/testdata/examples/channel.Async"%go.
@@ -1219,6 +1223,70 @@ Definition LeakyBufferPipelineⁱᵐᵖˡ {ext : ffi_syntax} {go_gctx : GoGlobal
     else do:  #());;;
     return: #()).
 
+(* Three-way leader election, from the Mixtris paper (§2.4).
+
+   Three participants are arranged in a ring. Each one races to either send to
+   its clockwise neighbour or receive from its counter-clockwise neighbour,
+   using a mixed-choice select. Mixed choice guarantees that at most one of the
+   three possible exchanges happens, so at most one participant is elected.
+
+   The elected leader announces itself by closing done. Closing an
+   already-closed channel panics, so this program is safe exactly when the
+   election elects at most one leader -- which is what the Hoare triple
+   {True} ThreeWayElection {True} certifies, via adequacy. It plays the role of
+   the paper's `free l`, whose safety likewise rests on being reached once.
+
+   go: mixtris_election.go:15:6 *)
+Definition ThreeWayElectionPartyⁱᵐᵖˡ {ext : ffi_syntax} {go_gctx : GoGlobalContext} : val :=
+  λ: "send" "recv" "id" "done",
+    exception_do (let: "done" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) "done") in
+    let: "id" := (GoAlloc go.uint64 "id") in
+    let: "recv" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) "recv") in
+    let: "send" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) "send") in
+    let: "$v0" := (![go.uint64] "id") in
+    let: "$ch0" := (![go.ChannelType go.sendrecv go.uint64] "send") in
+    let: "$ch1" := (![go.ChannelType go.sendrecv go.uint64] "recv") in
+    SelectStmt (SelectStmtClauses None [(CommClause (SendCase go.uint64 "$ch0" "$v0") (do:  #())); (CommClause (RecvCase go.uint64 "$ch1") (λ: "$recvVal",
+      do:  (let: "$a0" := (![go.ChannelType go.sendrecv go.uint64] "done") in
+      (FuncResolve go.close [go.ChannelType go.sendrecv go.uint64] #()) "$a0")
+      ))]);;;
+    return: #()).
+
+(* go: mixtris_election.go:25:6 *)
+Definition ThreeWayElectionⁱᵐᵖˡ {ext : ffi_syntax} {go_gctx : GoGlobalContext} : val :=
+  λ: <>,
+    exception_do (let: "ab" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) (GoZeroVal (go.ChannelType go.sendrecv go.uint64) #())) in
+    let: "$r0" := ((FuncResolve go.make1 [go.ChannelType go.sendrecv go.uint64] #()) #()) in
+    do:  ("ab" <-[go.ChannelType go.sendrecv go.uint64] "$r0");;;
+    let: "bc" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) (GoZeroVal (go.ChannelType go.sendrecv go.uint64) #())) in
+    let: "$r0" := ((FuncResolve go.make1 [go.ChannelType go.sendrecv go.uint64] #()) #()) in
+    do:  ("bc" <-[go.ChannelType go.sendrecv go.uint64] "$r0");;;
+    let: "ca" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) (GoZeroVal (go.ChannelType go.sendrecv go.uint64) #())) in
+    let: "$r0" := ((FuncResolve go.make1 [go.ChannelType go.sendrecv go.uint64] #()) #()) in
+    do:  ("ca" <-[go.ChannelType go.sendrecv go.uint64] "$r0");;;
+    let: "done" := (GoAlloc (go.ChannelType go.sendrecv go.uint64) (GoZeroVal (go.ChannelType go.sendrecv go.uint64) #())) in
+    let: "$r0" := ((FuncResolve go.make1 [go.ChannelType go.sendrecv go.uint64] #()) #()) in
+    do:  ("done" <-[go.ChannelType go.sendrecv go.uint64] "$r0");;;
+    let: "$a0" := (![go.ChannelType go.sendrecv go.uint64] "ab") in
+    let: "$a1" := (![go.ChannelType go.sendrecv go.uint64] "ca") in
+    let: "$a2" := #(W64 0) in
+    let: "$a3" := (![go.ChannelType go.sendrecv go.uint64] "done") in
+    let: "$go" := (FuncResolve ThreeWayElectionParty [] #()) in
+    do:  (Fork ("$go" "$a0" "$a1" "$a2" "$a3"));;;
+    let: "$a0" := (![go.ChannelType go.sendrecv go.uint64] "bc") in
+    let: "$a1" := (![go.ChannelType go.sendrecv go.uint64] "ab") in
+    let: "$a2" := #(W64 1) in
+    let: "$a3" := (![go.ChannelType go.sendrecv go.uint64] "done") in
+    let: "$go" := (FuncResolve ThreeWayElectionParty [] #()) in
+    do:  (Fork ("$go" "$a0" "$a1" "$a2" "$a3"));;;
+    let: "$a0" := (![go.ChannelType go.sendrecv go.uint64] "ca") in
+    let: "$a1" := (![go.ChannelType go.sendrecv go.uint64] "bc") in
+    let: "$a2" := #(W64 2) in
+    let: "$a3" := (![go.ChannelType go.sendrecv go.uint64] "done") in
+    let: "$go" := (FuncResolve ThreeWayElectionParty [] #()) in
+    do:  (Fork ("$go" "$a0" "$a1" "$a2" "$a3"));;;
+    return: #()).
+
 (* go: muxer.go:14:6 *)
 Definition mkStreamⁱᵐᵖˡ {ext : ffi_syntax} {go_gctx : GoGlobalContext} : val :=
   λ: "f",
@@ -1756,6 +1824,8 @@ Class Assumptions {ext : ffi_syntax} `{!GoGlobalContext} `{!GoLocalContext} `{!G
   #[global] client_unfold :: FuncUnfold client [] (clientⁱᵐᵖˡ);
   #[global] server_unfold :: FuncUnfold server [] (serverⁱᵐᵖˡ);
   #[global] LeakyBufferPipeline_unfold :: FuncUnfold LeakyBufferPipeline [] (LeakyBufferPipelineⁱᵐᵖˡ);
+  #[global] ThreeWayElectionParty_unfold :: FuncUnfold ThreeWayElectionParty [] (ThreeWayElectionPartyⁱᵐᵖˡ);
+  #[global] ThreeWayElection_unfold :: FuncUnfold ThreeWayElection [] (ThreeWayElectionⁱᵐᵖˡ);
   #[global] mkStream_unfold :: FuncUnfold mkStream [] (mkStreamⁱᵐᵖˡ);
   #[global] Async_unfold :: FuncUnfold Async [] (Asyncⁱᵐᵖˡ);
   #[global] Serve_unfold :: FuncUnfold Serve [] (Serveⁱᵐᵖˡ);
